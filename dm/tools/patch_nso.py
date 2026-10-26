@@ -92,7 +92,12 @@ if CHEAT_SRC:
             assert cur is not None, 'cheat file: code word before any [name]'
             cur['words'].append(int(w, 16)); i += 8
         else:
-            raise AssertionError(f'cheat file: unexpected character {c!r} at {i}')
+            # a junk line (a tool's header/footer; dmnt would reject the file): skip it whole -- but garbage inside
+            # a line that carries syntax (code word, name bracket) still aborts, as in dmnt
+            ls = bake_txt.rfind('\n', 0, i) + 1
+            if any(ch in '0123456789abcdefABCDEF[{' for ch in bake_txt[ls:i]): raise AssertionError(f'cheat file: unexpected character {c!r} at {i}')
+            j = bake_txt.find('\n', i)
+            i = len(bake_txt) if j < 0 else j
     for ch in parsed:
         if ch['master'] or bake_off.get(ch['name']): continue   # the master block only restores baselines; the stub's off path is the original
         mask, sites, cave, k, ok = 0, {}, {}, 0, True
@@ -1396,6 +1401,7 @@ if CHEAT_BAKE:
         return at + imm * 4
     cut_at = {c[0] for c in cuts}
     for idx, ch in enumerate(CHEAT_BAKE):
+        ch['baked'] = 0
         for off in sorted(ch['sites']):
             repl = ch['sites'][off]
             body = [repl]
@@ -1430,7 +1436,7 @@ if CHEAT_BAKE:
             cuts.append((off, struct.pack('<I', orig).hex(), struct.pack('<I', B(off, start)).hex(),
                          f'cheat patch "{ch["name"]}" (baked toggle flag {idx}, key mask {ch["mask"]:#x})', 'all'))
             stat('cheat')
-        ch['baked'] = sum(1 for c in cuts if c[4] == 'all' and f'"{ch["name"]}"' in c[3] and 'cheat patch' in c[3])
+            ch['baked'] += 1
     dropped = [c['name'] for c in CHEAT_BAKE if not c.get('baked')]
     CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c.get('baked')]
     hdr = bytearray(0x4000)
@@ -1474,7 +1480,9 @@ with open(P('sites.tsv'), 'w') as f:
     for t, bes, n in spin_sites: f.write(f'{t:#x}\tS\t' + ' '.join(f'{b:#x}' for b in bes) + '\n')   # spin wait: its head and the back-edges that enter its copy
 with open(P('cuts.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
-    for off, ob, nb, why in cuts: f.write(f'{off:#x}\t{ob}\t{nb}\t{why}\n')   # Columns: offset, original bytes, new bytes, reason
+    for c in cuts:   # Columns: offset, original bytes, new bytes, [scope,] reason (cheat patches append a scope)
+        off, ob, nb, why, scope = c if len(c) == 5 else (*c, 'all')
+        f.write(f'{off:#x}\t{ob}\t{nb}\t{why}\n' if len(c) == 4 else f'{off:#x}\t{ob}\t{nb}\t{scope}\t{why}\n')
 with open(P('obs.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')

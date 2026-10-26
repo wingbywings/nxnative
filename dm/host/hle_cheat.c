@@ -106,7 +106,16 @@ static int parse_cheats(const char *s, size_t len) {
             memcpy(w, s + i, 8); w[8] = 0;
             cur->def.op[cur->def.n++] = (uint32_t)strtoul(w, NULL, 16);
             i += 8;
-        } else return 0;                          // any other character rejects the whole file, as in dmnt
+        } else {
+            // A junk line -- a header or footer a cheat tool left in (this game's table ships its title line bare,
+            // without the braces that would make it the master). dmnt rejects such a file outright; we skip lines
+            // that carry no syntax at all, but garbage inside a code line still rejects the whole file, as in dmnt
+            size_t ls = i;
+            while (ls > 0 && s[ls - 1] != '\n') ls--;
+            for (size_t j = ls; j < i; j++)
+                if (isxdigit((unsigned char)s[j]) || s[j] == '[' || s[j] == '{') return 0;
+            while (i < len && s[i] != '\n') i++;
+        }
     }
     if (g_ent[0].def.n) g_ent[0].enabled = 1;                 // the master cheat cannot be disabled (dmnt parity)
     g_nent = 1;

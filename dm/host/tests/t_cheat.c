@@ -139,7 +139,14 @@ int main(void) {
     cheat_execute();
     CHECK(rd32(0x16000) == 0 && rd32(0x17000) == 0xE);
 
-    // 6. A malformed file is rejected whole: 'Z' is not a hex digit
+    // 6. A junk header line (a tool's title, like this game's bare table header) is skipped whole;
+    //    garbage inside a code line still rejects the file: 'Z' is not a hex digit
+    write_file("0123456789abcdef.txt", "\xE6\x97\xB7\xE9\x87\x8E\xE4\xB9\x8B\xE6\x81\xAF test table v1.9.0\n[Store]\n04000000 00011000 12345678\n");
+    set_on("Store");
+    CHECK(cheat_reload(g_dir) == 1);
+    *(uint32_t *)(M + 0x11000) = 0;
+    cheat_execute();
+    CHECK(rd32(0x11000) == 0x12345678);
     write_file("0123456789abcdef.txt", "[Bad]\n04000000 ZZ\n");
     unlink_file("toggles.txt");
     CHECK(cheat_reload(g_dir) == 0);
