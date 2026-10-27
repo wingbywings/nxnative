@@ -62,6 +62,20 @@ static int boot_env(void) {
     setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 0);
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
     setenv("DM_CHEATS_DIR", [doc stringByAppendingPathComponent:@"cheats"].fileSystemRepresentation, 0);   // Atmosphère-format cheat files (hle_cheat.c): <main build ID>.txt + toggles.txt, reloadable at run time
+    // Seed Documents/cheats from the table packed in the app (build_ipa.sh puts the game folder's cheats/<build ID>.txt at <App>/dm/cheats): without it a fresh install has no file cheats, and
+    // only baked patches would show in the menu. A file already there wins, so the player's edits and toggles.txt are never overwritten.
+    {
+        NSString *bch = [res stringByAppendingPathComponent:@"dm/cheats"];
+        if ([fm fileExistsAtPath:bch]) {
+            NSString *dch = [doc stringByAppendingPathComponent:@"cheats"];
+            [fm createDirectoryAtPath:dch withIntermediateDirectories:YES attributes:nil error:nil];
+            int seeded = 0;
+            for (NSString *f in [fm contentsOfDirectoryAtPath:bch error:nil])
+                if ([f hasSuffix:@".txt"] && ![fm fileExistsAtPath:[dch stringByAppendingPathComponent:f]] &&
+                    [fm copyItemAtPath:[bch stringByAppendingPathComponent:f] toPath:[dch stringByAppendingPathComponent:f] error:nil]) seeded++;
+            if (seeded) fprintf(stderr, "boot: cheat table seeded into Documents/cheats (%d file%s)\n", seeded, seeded == 1 ? "" : "s");
+        }
+    }
     NSString *dm = [res stringByAppendingPathComponent:@"dm"];
     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     setenv("DM_MSL_DIR", [res stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 0);

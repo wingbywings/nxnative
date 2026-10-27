@@ -353,6 +353,15 @@ def build_id(nso):
         f.seek(0x40); return f.read(16).hex()
 
 
+def cheat_table_for(nsp_dir, main):
+    """the game folder's cheat table for this main's build (cheats/<build ID>.txt, the first 8 bytes' hex as dmnt names it;
+    the 32-hex variant some tools produce too), or None: the rewriter bakes it (DM_CHEAT_FILE) and the app carries it"""
+    bid = build_id(main)
+    for cand in (nsp_dir / 'cheats' / f'{bid[:16]}.txt', nsp_dir / 'cheats' / f'{bid}.txt'):
+        if cand.exists(): return cand
+    return None
+
+
 def rmtree(p):
     if p.is_symlink() or p.is_file(): p.unlink()
     elif p.exists(): shutil.rmtree(p)
@@ -953,10 +962,7 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, nsp_dir, provisional=False):
     src = {m: exe_dir / m for m in mods} | nros
     names = list(src)
     cheat_file = None   # cheat patches baked in from the game folder's cheat file (code-write cheats cannot run at run time on iOS)
-    if 'main' in mods:
-        bid = build_id(exe_dir / 'main')
-        for cand in (nsp_dir / 'cheats' / f'{bid[:16]}.txt', nsp_dir / 'cheats' / f'{bid}.txt'):
-            if cand.exists(): cheat_file = cand; break
+    if 'main' in mods: cheat_file = cheat_table_for(nsp_dir, exe_dir / 'main')
     kf = out.with_name(out.name + '.key')
     key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py', 'nso_match.py')] + patch_files(repo, exe_dir, mods, env.get('DM_GAME')) + list(src.values()) + ([manifest] if manifest.is_file() else []) + ([cheat_file] if cheat_file else [])), names, capstone.__version__,
                       {k: env.get(k) for k in ('DM_PATCH_FRONT', 'DM_GAME')})
@@ -1694,6 +1700,8 @@ def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, 
     for d in ('save', 'temp'): (rd / d).mkdir(parents=True, exist_ok=True)
     renv = {'DM_ROOT': work, 'DM_ROMFS': game / 'RomFS', 'DM_SAVE': rd / 'save', 'DM_TEMP': rd / 'temp', 'DM_MSL_DIR': msl, 'DM_FONT_DIR': font}
     if aoc: renv['DM_AOC_DIR'] = aoc
+    tbl = cheat_table_for(work.parent, game / 'ExeFS' / 'main')   # the game folder's cheat table runs from the Mac host as well (code writes included: the Mac's code pages can be unsealed)
+    if tbl: renv['DM_CHEATS_DIR'] = tbl.parent
     if gfx == 'nvn': renv['DM_NVN_SHMAP'] = g.table('shader_map.tsv')
     renv.update(DM_LANG=lang, DM_WINDOW=1, DM_AUDIO=1)
     if env_file: renv.update(env_file_pairs(env_file))
@@ -2070,6 +2078,8 @@ def main(args=None):
     if not prepare_xcode and free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
     ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang)
+    cheat_tbl = cheat_table_for(nsp_dir, game / 'ExeFS' / 'main')   # the app carries the table (main.m seeds it into Documents/cheats at first launch): the cheats the rewriter cannot bake, pointer chains and the like, work on a fresh install too
+    if cheat_tbl: ipa_env['DM_CHEAT_TABLE'] = str(cheat_tbl)
     if prepare_xcode: ipa_env['DM_XCODE_PROJECT_DIR'] = str(project.parent)
     if app_version: ipa_env['DM_APP_VERSION'] = app_version
     if icon: ipa_env['DM_ICON'] = str(icon); say(f'app icon: {icon}')   # app icon (found above)
