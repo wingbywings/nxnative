@@ -13,14 +13,15 @@ static int hid_usleep(useconds_t usec);
 
 static int checks, fails, g_mode = 1, g_signals;
 static void *g_signalled;
+static uint64_t g_now = 1000000000ull;
 static time_t rumble_second = 1;
 static void (*script_hold)(void);
 static int hid_clock_gettime(clockid_t clock, struct timespec *ts) { (void)clock; *ts = (struct timespec){.tv_sec = rumble_second}; return 0; }
 static int hid_usleep(useconds_t usec) { (void)usec; if (script_hold) script_hold(); return 0; }
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
 int dm_opmode(void) { return g_mode; }
-uint64_t guest_ns(void) { return 1000000000ull; }
-uint64_t now_ns(void) { return 1000000000ull; }
+uint64_t guest_ns(void) { return g_now; }
+uint64_t now_ns(void) { return g_now; }
 uint64_t dm_guest_frame(void) { return 0; }
 void dm_touch_set(const dm_touch *t, int n) { (void)t; (void)n; }
 int touch_fill_n(void *out, int max, uint64_t now) { (void)out; (void)max; (void)now; return 0; }
@@ -167,6 +168,59 @@ static void t_vibration(void) {
     CHECK(!h_hid_VibPermit() && !h_hid_VibHandles(h, 2, &id, STYLE_HANDHELD), "rumble disabled: no vibration devices");
 }
 
+// Real six-axis sources (dm_motion_pad / dm_motion_device) through the rings and both sensor surfaces, with the synthetic flat / shake states preserved
+static void t_motion(void) {
+    g_mode = 1; ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); dm_pad_players(3);
+    g_now = 2000000000ull;   // past any shake window an earlier test left active (a released shake runs to the next whole cycle on the guest clock)
+    uint32_t h1[2] = {0}, h2[2] = {0}, id = 0;
+    h_hid_SixHandles(h1, 2, &id, STYLE_FULLKEY); h_hid_SixHandles(h2, 2, &(uint32_t){1}, STYLE_FULLKEY);
+    SixAxisState s[3];
+    SevenSixAxisState sv[2];
+    const float pi = (float)M_PI;
+
+    // No source: at rest lying flat, the console sensor answers 0 entries, as it always did
+    CHECK(six_states(s, 2, h1[0]) == 2 && s[0].acc[0] == 0 && s[0].acc[2] == -1 && s[0].gyro[2] == 0 && s[0].dir[0] == 1 && s[0].attributes == 1, "no source: at rest lying flat");
+    CHECK(s[1].sampling == s[0].sampling - 1 && s[1].delta_ns == SIX_PERIOD_NS, "no source: history numbered 5 ms apart");
+    CHECK(h_hid_SevenStates(sv, 2) == 0 && h_hid_SixRest(&h1[0]) == 1 && h_hid_SevenRest() == 1, "no source: 0 console entries, at rest");
+
+    // A controller IMU: samples stamped as they arrive, a read returns them interpolated at its 5 ms times (rad/s in, revolutions/s out;
+    // the quaternion's matrix rows are the body's axes, so a +90-degree z rotation passed as the conjugate matches the synthetic +yaw direction)
+    float quat[4] = {0, 0, -0.38268343f, 0.92387953f};
+    dm_motion_pad(0, (float[3]){0.1f, -0.2f, -0.98f}, (float[3]){2 * pi, 0, 0}, quat);   // at 2 s
+    g_now += 6000000;
+    dm_motion_pad(0, (float[3]){0.3f, -0.2f, -0.95f}, (float[3]){0, 0, 4 * pi}, quat);   // at 2.006 s
+    g_now += 4000000;   // 2.010 s: the grid times 2.010 / 2.005 / 2.000 s clamp, interpolate and hit
+    CHECK(six_states(s, 3, h1[0]) == 3, "a source serves the whole history");
+    CHECK(fabsf(s[0].acc[0] - 0.3f) < 1e-6, "an entry past the newest sample clamps to it");
+    CHECK(fabsf(s[1].acc[0] - (0.1f + 0.2f * 5.f / 6.f)) < 1e-6 && fabsf(s[1].gyro[2] - 2.0f * 5.f / 6.f) < 1e-6, "an entry between samples is interpolated");
+    CHECK(fabsf(s[1].dir[0] - 0.70710678f) < 1e-5 && fabsf(s[1].dir[1] - 0.70710678f) < 1e-5 && fabsf(s[1].dir[4] - 0.70710678f) < 1e-5 && fabsf(s[1].dir[8] - 1) < 1e-5, "the direction matrix of the quaternion");
+    CHECK(fabsf(s[2].acc[0] - 0.1f) < 1e-6 && s[2].angle[0] == 0, "the oldest grid time hits the first sample, its angle still zero");
+
+    // The device's sensors take over when the controller's IMU goes stale (past 200 ms), and stay put for player 2's own ring
+    float dquat[4] = {0, 0, 0, 1};
+    g_now += MOTION_FRESH_NS + SIX_PERIOD_NS;
+    dm_motion_device((float[3]){-0.5f, 0, -1}, (float[3]){0, 0, 0}, dquat);
+    dm_motion_pad(1, (float[3]){0.9f, 0.1f, -1}, (float[3]){0, 2 * pi, 0}, dquat);
+    CHECK(six_states(s, 1, h1[0]) == 1 && fabsf(s[0].acc[0] + 0.5f) < 1e-6 && s[0].dir[0] == 1, "a stale controller IMU falls back to the device's sensors");
+    CHECK(six_states(s, 1, h2[0]) == 1 && fabsf(s[0].acc[0] - 0.9f) < 1e-6 && fabsf(s[0].gyro[1] - 1.0f) < 1e-6, "player 2 reads its own ring");
+    CHECK(h_hid_SixRest(&h1[0]) == 1 && h_hid_SixRest(&h2[0]) == 1, "small velocity reads as at rest");
+
+    // The console sensor reads the same source (player 1's rule: the device's now): its layout carries the velocity at 0x18, the angle at 0x24 and the quaternion at 0x30
+    CHECK(h_hid_SevenStates(sv, 2) == 2 && sv[0].gyro[0] == 0 && sv[0].quat[3] == 1 && sv[0].sampling == sv[1].sampling + 1 && sv[0].attributes == 1, "the console sensor serves the device source, newest first");
+
+    // A shake replaces the real data while it lasts, whole cycles, and the real data comes back after it
+    dm_motion_device((float[3]){0.4f, 0, -1}, (float[3]){8 * pi, 8 * pi, 8 * pi}, dquat);   // moving: not at rest, fresh for the shake window
+    CHECK(h_hid_SixRest(&h1[0]) == 0 && h_hid_SevenRest() == 0, "a moving source is not at rest");
+    g_now += SIX_PERIOD_NS; dm_pad_set(DM_BTN_SHAKE, 0, 0, 0, 0);
+    uint64_t t0 = g_now; g_now = t0 + SHAKE_CYCLE_NS / 4;
+    CHECK(six_states(s, 1, h1[0]) == 1 && s[0].acc[2] == -1 && fabsf(s[0].acc[0]) > 2 && fabsf(s[0].gyro[2]) > 1, "a shake replaces the real data with its calibrated motion");
+    dm_pad_set(0, 0, 0, 0, 0);
+    g_now = t0 + SHAKE_CYCLE_NS * 3;
+    dm_motion_device((float[3]){0.4f, 0, -1}, (float[3]){0, 0, 0}, dquat);
+    CHECK(six_states(s, 1, h1[0]) == 1 && fabsf(s[0].acc[0] - 0.4f) < 1e-6 && s[0].dir[0] == 1, "after the shake the real data returns");
+    CHECK(h_hid_SevenStates(sv, 1) == 1, "the console sensor serves entries again once the shake is over");
+}
+
 static void *vibration_sender(void *arg) {
     (void)arg;
     const uint32_t handles[] = {3, 0};
@@ -250,6 +304,7 @@ int main(void) {
     t_script();
     t_vibration();
     t_rumble_log();
+    t_motion();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

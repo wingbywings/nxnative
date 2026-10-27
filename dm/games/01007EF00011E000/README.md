@@ -105,11 +105,16 @@ On the Mac, frame times stayed at 60 fps; crop comparisons showed sharper edges 
 
 - **Resolved: crashes in `CommandListProcessor::Process` (SIGSEGV under `render_main`, at 60 s and 134 s in the shrine).** SDK 20's `AudioRenderSystem` has another layout (getters inlined, `GenerateCommand` takes and returns a `Span<std::byte>`, device and mode at +0x48 / +0x4c, command buffer at +0xf8 / +0x100, `UpdateImpl` locks +0x2d0; DeviceSink is command 0x14). The public `ExecuteAudioRendererRendering` (`sdk+0x221e90`) reaches `AudioRendererImpl::ExecuteAudioRendererRendering` (`sdk+0x22ca88`) through the vtable, so the host's takeover of the `Impl` function was never called: the SDK's own `AudioRenderSystem::ExecuteAudioRendererRendering` ran with no update lock, every `RequestUpdate` rendered a catch-up frame, and two threads wrote the same command buffer. The host now also takes over the PLT target; catch-ups fell from one per update to 3 per run.
 
+## Input
+
+- The gyro shrines (the tilt mazes) and gyro aiming read the six-axis sensors, which now carry real data: a connected controller's IMU first, else the device's own sensors on the iPhone ([Six-axis sensors](../../../docs/reference/services.md#six-axis-sensors)); the calibrated `DM_BTN_SHAKE` shake replaces real data while it lasts, so nothing of the old behaviour changes without a source. Not yet verified on a device: which sensor a shrine reads and the field meanings at 0x18 of the console state.
+- The console sensor's state layout, from this game's `sdk` and `main` (1.9.0): 0x60 stride (`sdk+0x504e28`); the game reads one state (`main+0x1260f5c`, `count 1`, behind an `IsVrMode` / control-scheme gate) and builds two matrices from it — one straight from six floats at 0x18, one from the orientation quaternion (x, y, z, w) at 0x30 that it converts itself (`main+0x1260f74`). The host fills the velocity at 0x18, the angle at 0x24 and the quaternion at 0x30 (`hle_hid.c`); what the game's first matrix makes of 0x18 decides the maze and may need the fields swapped once seen on a device.
+
 ## Services and loading
 
 - **Resolved: every pointer in `.data` / the GOT a module offset, crashes everywhere.** SDK 20 packs relative relocations as `DT_RELR`: `main` has 223,994 of them (`relr_apply` in `loader.c`).
 - **Resolved: SIGBUS inside Metal (`AGCDeserializedReply`) at a guest-stack address.** Ending a render pass inside `nvnQueueSubmitCommands` made the driver compile its fast-clear blit on the render thread's small stack; every implemented NVN function except the recording calls now runs on the 512 KB host stack (`nvn_big_entry`).
-- SDK 20 calls it needed: `applet::GetAppletResourceUserId` (SDK 20's `OpenAudioRenderer` aborts on ARUID 0; the host reports 0x80), `pl::RequestSharedFontLoad`, `pl::IsVrMode` / `BeginVrMode` / `EndVrMode`, `pctl::CheckStereoVisionPermission` (permitted), `oe::TryPopLaunchParameter` (none), `time::StandardSteadyClock::GetCurrentTimePoint`, the console six-axis sensor (`hid::*SevenSixAxisSensor*`: zero states) and more `nfp` calls (`AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`; two-argument `Mount`, `Unmount`, `GetCommonInfo`, `GetRegisterInfo`, `GetState`, `Finalize`). `nvnPrivate0` (a flag in `sdk`'s bss) stays 0, and `nn::ro::ProtectRelro` runs natively on the host's no-op permission calls.
+- SDK 20 calls it needed: `applet::GetAppletResourceUserId` (SDK 20's `OpenAudioRenderer` aborts on ARUID 0; the host reports 0x80), `pl::RequestSharedFontLoad`, `pl::IsVrMode` / `BeginVrMode` / `EndVrMode`, `pctl::CheckStereoVisionPermission` (permitted), `oe::TryPopLaunchParameter` (none), `time::StandardSteadyClock::GetCurrentTimePoint`, the console six-axis sensor (`hid::*SevenSixAxisSensor*`: the real sources' states, 0 entries without one) and more `nfp` calls (`AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`; two-argument `Mount`, `Unmount`, `GetCommonInfo`, `GetRegisterInfo`, `GetState`, `Finalize`). `nvnPrivate0` (a flag in `sdk`'s bss) stays 0, and `nn::ro::ProtectRelro` runs natively on the host's no-op permission calls.
 - `main` imports `ScalableFontEngineHelper::Decode` (SDK 20), so the shared font is served as BFTTF. Focus handling mode 2 (focus notifications are sent).
 - Rewriter: 1 to 6 halfword jump tables in `main` changed when `half_count` padded only to their largest entry.
 
@@ -189,6 +194,8 @@ General host changes first needed here; each applies to every game:
 - **Shared performance work, checked independently of prewarm data:** [CPU deswizzle copies use slice and row offsets](../../../docs/reference/nvn-objects.md#cpu-deswizzle-copies-use-slice-and-row-offsets) and [Host symbol indexes avoid repeated name scans](../../../docs/reference/services.md#host-symbol-indexes-avoid-repeated-name-scans). [PR #261](https://github.com/seedds/nxnative/pull/261) reports M2 iPad Pro gameplay on update 1.9.0; local verification covers synthetic correctness and CPU microbenchmarks, without a new game/device run.
 - **Final #158/#213 gameplay validation:** [Current results](#final-synchronization-and-pass-validation-2026-10-26-current) distinguish the retained pass savings from the timing gains not demonstrated on this Mac.
 
+- **Real six-axis data and the console sensor's state layout** (`dm_motion_pad` / `dm_motion_device`, `motion_apple.m`, `DM_MOTION`): [Six-axis sensors](../../../docs/reference/services.md#six-axis-sensors); the layout in [Input](#input). Verified by the host tests and this build's disassembly; on-device shrine play still to check.
+
 - **Resolved: the IPA omitted pulling libraries with `pso_mtl4 on`, and explicitly including them failed under macOS Bash 3.2.** See [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs).
 - **Upscaling in the present** (`fx_encode`, `DM_PRESENT_UPSCALE`): [The present upscales through MetalFX](../../../docs/reference/rendering.md#the-present-upscales-through-metalfx).
 - **Thermal cap; resolved movie recovery and acquire/present races** (`thermal_capped`, `DM_THERMAL_CAP`): [A thermally serious iPhone holds 30 fps](../../../docs/reference/frame-rate.md#a-thermally-serious-iphone-holds-30-fps).
@@ -212,6 +219,8 @@ General host changes first needed here; each applies to every game:
 - **Hitch dumps and guest thread names** (`DM_HITCH_DUMP`), **heap probes** (`DM_PROBE_HEAP*`), **autorelease leaks**: [05, Scripted input and thread scheduling](../../../docs/agents/05-debugging.md#scripted-input-and-thread-scheduling), [05, Memory growth](../../../docs/agents/05-debugging.md#memory-growth).
 
 ## Open
+
+- The motion shrines and gyro aiming with real six-axis data are verified by the host tests and disassembly only ([Input](#input)); on a device, the shrine tilt, which sensor it reads and the console state's fields at 0x18 are to check.
 
 - The shipped pipeline archive without the device's own earlier prebuild files (the test iPhone's `pso_archive/` still held them, [Pipelines on a cold start](#pipelines-on-a-cold-start)): the footprint against the app's memory limit and the frame times after it.
 

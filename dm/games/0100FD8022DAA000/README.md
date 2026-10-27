@@ -8,7 +8,7 @@ Update 1.4.0 (v393216) over the base game, SDK 18.3.5. NERD's Hagi Wii layer, as
 |---|---|---|
 | Node area cut 1 GB → 62 MB | `dm/tools/sdk_patches.py`, `sdk` build `6075151627016eef…` (shared with Galaxy) | the movie player's 384 MB allocator aborted the game at boot; see [Memory](#memory) |
 | 1.25 GB block: `mem_reserve 0x50000000`, `mem_alias 0x20000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | [`game.tsv`](game.tsv) | a 512 MB alias region for that allocator; the guessed 256 MB held nothing after the node area |
-| `op_mode handheld` | `game.tsv` | the pointer (star bits, menus, the file select) is the touch screen in handheld mode; docked it is the Joy-Con gyro, which the host does not have |
+| `op_mode handheld` | `game.tsv` | the pointer (star bits, menus, the file select) is the touch screen in handheld mode; docked it is the Joy-Con gyro, which the host now feeds with real data ([Six-axis sensors](../../../docs/reference/services.md#six-axis-sensors)) but this game was brought up on the touch screen, so it stays handheld |
 | `pad_layout full` | `game.tsv` | the 3D gamepad layout |
 | `modules main subsdk0 sdk` | `game.tsv` | `subsdk1`–`subsdk4` are replaced by the host's Vulkan layer |
 | `vk_capture.tsv` | profile | the keys of the SPIR-V modules Hagi generates at run time, captured by the NSP script as for Galaxy |

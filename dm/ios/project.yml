@@ -48,6 +48,7 @@ targets:
         GCSupportsControllerUserInteraction: true   # Physical controllers (GameController)
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad
+        NSMotionUsageDescription: The game's motion controls use this device's gyroscope.   # six-axis input (CoreMotion, motion_apple.m); DM_MOTION=0 in env.txt never starts it
         CADisableMinimumFrameDurationOnPhone: true
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

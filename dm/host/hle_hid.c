@@ -2,7 +2,8 @@
 // Generic, game-independent version: player 1 is always connected, as the handheld controller (Npad id 0x20) with DM_OPMODE=0 (handheld), otherwise as the 1P full-key controller (id 0);
 // players 2..8 are full-key controllers on No2..No8 (ids 1..7) while the front end reports a controller for them (dm_pad_players; the Mac gives each physical controller a player
 // of its own, front_mac.m). A player whose npad the game does not support (SetSupportedNpadIdType) is not reported: in a one-player game it feeds player 1, otherwise it is not used.
-// Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, player 1's shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
+// Six-axis sensor: one per connected controller (two for handheld). Real data when the front end publishes it -- a controller's IMU (dm_motion_pad) or the device's own sensors
+// (dm_motion_device), the controller's while it is fresh -- otherwise at rest lying flat, player 1's shaken side to side while the front end holds DM_BTN_SHAKE (see below).
 // Vibration follows the player assignments through hle_haptics.c. Mouse and keyboard: not connected; the controller applet reports the connected players with player 1 selected.
 #include "hle.h"
 #include "hle_haptics.h"
@@ -328,10 +329,85 @@ HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoE
     if (info) { info[0] = count; info[1] = (int32_t)connected_id(); }
     return RES_OK;
 }
+// Real six-axis data (dm_motion_pad for a controller's IMU, dm_motion_device for the device's own sensors; GameController's GCControllerMotion and CoreMotion in motion_apple.m).
+// A ring per source of the latest samples, stamped with guest_ns() as they arrive: a read takes the player's controller's IMU while it is fresh (200 ms), else the device's while
+// it is fresh -- a controller without an IMU never publishes, so the device's sensors stay in effect -- and without either source the sensor lies flat as before. A sample carries
+// the acceleration in G, the angular velocity in revolutions / s, the attitude as the quaternion (x, y, z, w) of the body's axes in the world (the conjugate of Apple's attitude,
+// which rotates reference vectors into the device's frame) with the direction matrix built from it, and the angle, the velocity integrated as samples arrive.
+// DM_MOTION=0 publishes neither: every sensor reads as it did before
+enum { MOTION_RING = 32, MOTION_FRESH_NS = 200000000 };
+typedef struct { uint64_t t_ns; float acc[3], gyro[3], quat[4], rot[9], angle[3]; } motion_sample;
+typedef struct { pthread_mutex_t mu; int n, head; motion_sample ring[MOTION_RING]; } motion_src;
+static motion_src g_motion_pad[DM_PLAYERS], g_motion_dev;
+#define MOTION_NEWEST(s) ((s)->head + MOTION_RING - 1) % MOTION_RING   // head is the next slot to write: the newest sample is the one before it
+static int motion_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_MOTION"); on = e ? !!atoi(e) : 1; } return on;
+}
+static void motion_quat(float rot[9], const float q[4]) {   // the quaternion's direction matrix, row-major
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    rot[0] = 1 - 2 * (y * y + z * z); rot[1] = 2 * (x * y - z * w);     rot[2] = 2 * (x * z + y * w);
+    rot[3] = 2 * (x * y + z * w);     rot[4] = 1 - 2 * (x * x + z * z); rot[5] = 2 * (y * z - x * w);
+    rot[6] = 2 * (x * z - y * w);     rot[7] = 2 * (y * z + x * w);     rot[8] = 1 - 2 * (x * x + y * y);
+}
+static void motion_put(motion_src *s, const float acc[3], const float gyro[3], const float quat[4]) {
+    uint64_t now = guest_ns();
+    pthread_mutex_lock(&s->mu);
+    const motion_sample *prev = s->n ? &s->ring[MOTION_NEWEST(s)] : NULL;
+    motion_sample *m = &s->ring[s->head];
+    m->t_ns = now;
+    for (int i = 0; i < 3; i++) { m->acc[i] = acc[i]; m->gyro[i] = gyro[i] / (float)(2 * M_PI); }   // rad/s in, revolutions/s out
+    for (int i = 0; i < 4; i++) m->quat[i] = quat[i];
+    motion_quat(m->rot, quat);
+    for (int i = 0; i < 3; i++)   // the trapezoid of the two samples' velocities over their gap
+        m->angle[i] = (prev ? prev->angle[i] : 0) + (prev && now > prev->t_ns ? (prev->gyro[i] + m->gyro[i]) / 2 * (float)(now - prev->t_ns) / 1e9f : 0);
+    s->head = (s->head + 1) % MOTION_RING; if (s->n < MOTION_RING) s->n++;
+    pthread_mutex_unlock(&s->mu);
+}
+void dm_motion_pad(int player, const float acc[3], const float gyro[3], const float quat[4]) {
+    if (motion_on() && player >= 0 && player < DM_PLAYERS) motion_put(&g_motion_pad[player], acc, gyro, quat);
+}
+void dm_motion_device(const float acc[3], const float gyro[3], const float quat[4]) { if (motion_on()) motion_put(&g_motion_dev, acc, gyro, quat); }
+static motion_src *motion_pick(int player, uint64_t now) {   // the source a sensor read takes: the controller's IMU, else the device's, else none
+    if (!motion_on()) return NULL;
+    motion_src *s[2] = { &g_motion_pad[player >= 0 && player < DM_PLAYERS ? player : 0], &g_motion_dev };
+    for (int i = 0; i < 2; i++) {
+        pthread_mutex_lock(&s[i]->mu);
+        int fresh = s[i]->n && now - s[i]->ring[MOTION_NEWEST(s[i])].t_ns <= MOTION_FRESH_NS;
+        pthread_mutex_unlock(&s[i]->mu);
+        if (fresh) return s[i];
+    }
+    return NULL;
+}
+static int motion_at(motion_src *s, uint64_t now, uint64_t t, motion_sample *out) {   // the sample at guest time t, interpolated between the entries around it
+    int ok = 0;
+    pthread_mutex_lock(&s->mu);
+    if (s->n) {
+        int newest = MOTION_NEWEST(s);
+        if (now - s->ring[newest].t_ns <= MOTION_FRESH_NS) {
+            int a = -1, b = newest;   // a the newest entry at or before t, b the one after it (b == a when clamped at an end)
+            for (int k = 0; k < s->n; k++) { int e = (newest + MOTION_RING - k) % MOTION_RING; if (s->ring[e].t_ns <= t) { a = e; b = k ? (newest + MOTION_RING - k + 1) % MOTION_RING : e; break; } }
+            if (a < 0) a = b = (newest + MOTION_RING - (s->n - 1)) % MOTION_RING;   // older than the ring: the oldest entry
+            *out = s->ring[a];
+            if (b != a && s->ring[b].t_ns > s->ring[a].t_ns) {
+                float f = (float)(t - s->ring[a].t_ns) / (float)(s->ring[b].t_ns - s->ring[a].t_ns);
+                float *o = &out->acc[0]; const float *pa = &s->ring[a].acc[0], *pb = &s->ring[b].acc[0];
+                for (int i = 0; i < 3 + 3 + 4 + 9 + 3; i++) o[i] += (pb[i] - pa[i]) * f;   // acc, gyro, quat, rot, angle are one run of floats
+                float n = sqrtf(out->quat[0] * out->quat[0] + out->quat[1] * out->quat[1] + out->quat[2] * out->quat[2] + out->quat[3] * out->quat[3]);
+                if (n > 0) for (int i = 0; i < 4; i++) out->quat[i] /= n;
+            }
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
+
 // Six-axis sensor (accelerometer + gyroscope) of the connected controller. SixAxisSensorState (0x60): acceleration in G, angular velocity in revolutions / s, angle in revolutions,
 // direction = the controller's three axes. At rest it lies flat: gravity (0, 0, -1), no rotation, the identity direction. While shaking (DM_BTN_SHAKE: the iPhone shaken, DmGamepad.m;
-// Space on the Mac; DM_KEYS Shake) it moves side to side, x acceleration ±SHAKE_G with a yaw of ±SHAKE_REV, in whole cycles that end where they began. Samples are 5 ms apart on the
-// guest clock, as the sensor's 200 Hz, and numbered by time, so a history read returns the samples at those times. Super Mario Odyssey reads all 16 entries of GetSixAxisSensorStates
+// Space on the Mac; DM_KEYS Shake) it moves side to side, x acceleration ±SHAKE_G with a yaw of ±SHAKE_REV, in whole cycles that end where they began -- a whole history entry inside
+// a shake reads the shake, so the calibrated motion Odyssey's swing detector is tuned to stays exact. Samples are 5 ms apart on the
+// guest clock, as the sensor's 200 Hz, and numbered by time, so a history read returns the samples at those times; a real source's entries are its samples interpolated at those
+// times. Super Mario Odyssey reads all 16 entries of GetSixAxisSensorStates
 // whatever count comes back (main+0x93fd84), takes the newest entry's acceleration for its swing detection (main+0x626244) and its angular velocity, angle and direction (main+0x5d72d4)
 typedef struct { int64_t delta_ns, sampling; float acc[3], gyro[3], angle[3], dir[9]; uint32_t attributes, _pad; } SixAxisState;
 _Static_assert(sizeof(SixAxisState) == 0x60, "SixAxisState");
@@ -339,10 +415,15 @@ enum { SIX_PERIOD_NS = 5000000 };
 #define SHAKE_G 3.0
 #define SHAKE_REV 1.5
 static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
-static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
+static void six_sample(SixAxisState *s, int64_t samp, int shakes, const motion_sample *m) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;   // IsConnected
+    if (m) {
+        for (int i = 0; i < 3; i++) { s->acc[i] = m->acc[i]; s->gyro[i] = m->gyro[i]; s->angle[i] = m->angle[i]; }
+        for (int i = 0; i < 9; i++) s->dir[i] = m->rot[i];
+        return;
+    }
     s->acc[2] = -1;
     double yaw = 0;
     if (shakes && shaking(t)) {
@@ -361,9 +442,16 @@ static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
-    int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    int shakes = player_of(h >> 8 & 0xff) == 0;
-    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
+    uint64_t now = guest_ns();
+    int64_t samp = (int64_t)(now / SIX_PERIOD_NS);
+    int pl = player_of(h >> 8 & 0xff);
+    motion_src *src = motion_pick(pl, now);
+    for (int i = 0; i < n; i++) {
+        uint64_t t = (uint64_t)(samp - i) * SIX_PERIOD_NS;
+        motion_sample m;
+        int real = src && !shaking(t) && motion_at(src, now, t, &m);   // a shake in progress replaces the real data of that entry
+        six_sample(&out[i], samp - i, pl == 0, real ? &m : NULL);
+    }
     return n;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
@@ -518,15 +606,54 @@ HLE_FORCE("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", "gesture states,
 // Six-axis details: the current state, at rest unless shaking, fusion off
 HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
-HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless player 1's is shaking", unsigned, h_hid_SixRest, const uint32_t *h) { return player_of(*h >> 8 & 0xff) != 0 || !shaking(guest_ns()); }
-// The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched through the hid service. The host provides none: switching succeeds, 0 states
-HLE_FORCE("_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm", "console six-axis sensor initialization; not provided by the host", Result, h_hid_SevenInit, void *buf, size_t n) { (void)buf; (void)n; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: the real data's velocity while there is any, yes otherwise unless player 1's is shaking", unsigned, h_hid_SixRest, const uint32_t *h) {
+    int pl = player_of(*h >> 8 & 0xff);
+    if (pl != 0) return 1;
+    uint64_t now = guest_ns();
+    if (shaking(now)) return 0;
+    motion_src *src = motion_pick(0, now); motion_sample m;
+    return !src || !motion_at(src, now, now, &m) || fabsf(m.gyro[0]) + fabsf(m.gyro[1]) + fabsf(m.gyro[2]) < 0.05f;   // about 18 degrees/s
+}
+// The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched
+// through the hid service. It reads the same real sources as the controllers' sensors (motion_pick of player 1); with none it answers 0 states, as it always did.
+// SevenSixAxisSensorState is 0x60 with another layout than SixAxisSensorState: Breath of the Wild's sdk copies its shared-memory entries out one stride of 0x60 (sdk+0x504e28)
+// and the game reads six floats at 0x18 and the orientation quaternion (x, y, z, w) at 0x30, which it turns into a matrix (main+0x1260f74). The six floats sit as two three-vector
+// fields, the velocity and the angle (the state is the console's, a fused orientation sensor); the acceleration goes at 0x40, past every offset this build reads. Not verified on
+// hardware: what the game builds from 0x18 decides the maze, and the fields may need swapping once seen on a device
+typedef struct {
+    int64_t delta_ns, sampling;
+    float _unknown[2];   // 0x10: not read by Breath of the Wild
+    float gyro[3], angle[3], quat[4], acc[3];
+    uint32_t attributes, _pad[4];
+} SevenSixAxisState;
+_Static_assert(sizeof(SevenSixAxisState) == 0x60, "SevenSixAxisState");
+static int seven_states(SevenSixAxisState *out, int n) {
+    uint64_t now = guest_ns();
+    int64_t samp = (int64_t)(now / SIX_PERIOD_NS);
+    motion_src *src = motion_pick(0, now);
+    if (!src || shaking(now)) return 0;   // no real source: 0 states, as before
+    for (int i = 0; i < n; i++) {
+        motion_sample m;
+        memset(&out[i], 0, sizeof out[i]);
+        out[i].delta_ns = SIX_PERIOD_NS; out[i].sampling = samp - i; out[i].attributes = 1;   // IsConnected
+        if (!motion_at(src, now, (uint64_t)(samp - i) * SIX_PERIOD_NS, &m)) continue;
+        for (int k = 0; k < 3; k++) { out[i].gyro[k] = m.gyro[k]; out[i].angle[k] = m.angle[k]; out[i].acc[k] = m.acc[k]; out[i].quat[k] = m.quat[k]; }
+        out[i].quat[3] = m.quat[3];
+    }
+    return n;
+}
+HLE_FORCE("_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm", "console six-axis sensor initialization; reads the real sources when any", Result, h_hid_SevenInit, void *buf, size_t n) { (void)buf; (void)n; return RES_OK; }
 HLE_FORCE("_ZN2nn3hid26FinalizeSevenSixAxisSensorEv", "console six-axis sensor", Result, h_hid_SevenFini, void) { return RES_OK; }
-HLE_FORCE("_ZN2nn3hid23StartSevenSixAxisSensorEv", "console six-axis sensor; not provided by the host", Result, h_hid_SevenStart, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid23StartSevenSixAxisSensorEv", "console six-axis sensor; always sampling on the host", Result, h_hid_SevenStart, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3hid22StopSevenSixAxisSensorEv", "console six-axis sensor", Result, h_hid_SevenStop, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3hid32ResetSevenSixAxisSensorTimestampEv", "console six-axis sensor timestamp", void, h_hid_SevenReset, void) {}
-HLE_FORCE("_ZN2nn3hid27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi", "console six-axis sensor states: 0 entries", int, h_hid_SevenStates, void *out, int n) { (void)out; (void)n; return 0; }
-HLE_FORCE("_ZN2nn3hid26IsSevenSixAxisSensorAtRestEv", "console six-axis sensor at rest: yes (Super Mario Odyssey)", unsigned, h_hid_SevenRest, void) { return 1; }
+HLE_FORCE("_ZN2nn3hid27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi", "console six-axis sensor states: the real sources', newest first, else 0 entries", int, h_hid_SevenStates, void *out, int n) { return n > 0 ? seven_states((SevenSixAxisState *)out, n) : 0; }
+HLE_FORCE("_ZN2nn3hid26IsSevenSixAxisSensorAtRestEv", "console six-axis sensor at rest: the real data's velocity, yes otherwise (Super Mario Odyssey)", unsigned, h_hid_SevenRest, void) {
+    uint64_t now = guest_ns();
+    if (shaking(now)) return 0;
+    motion_src *src = motion_pick(0, now); motion_sample m;
+    return !src || !motion_at(src, now, now, &m) || fabsf(m.gyro[0]) + fabsf(m.gyro[1]) + fabsf(m.gyro[2]) < 0.05f;
+}
 // The development debug pad (Super Mario Odyssey initializes and polls it): never connected, all zero
 HLE_FORCE("_ZN2nn3hid18InitializeDebugPadEv", "debug pad; the host has none", void, h_hid_DbgPadInit, void) {}
 HLE_FORCE("_ZN2nn3hid16GetDebugPadStateEPNS0_13DebugPadStateE", "debug pad state: not connected (all 0)", void, h_hid_DbgPadState, void *st) { memset(st, 0, 32); }   // sampling number, attributes, buttons, two sticks

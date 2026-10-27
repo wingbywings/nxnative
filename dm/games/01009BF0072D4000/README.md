@@ -8,7 +8,7 @@ On the Mac: the opening course, the cutscene that follows it and the title menu;
 
 | Setting | Where | Why |
 |---|---|---|
-| `op_mode handheld` | [`game.tsv`](game.tsv) | docked, the game's pointer (touch blocks, stunning enemies) is the Joy-Con gyro, which the host does not have; handheld, it is the touch screen, which the iPhone front end feeds with the touches no gamepad control takes. Handheld also renders at 720p |
+| `op_mode handheld` | [`game.tsv`](game.tsv) | docked, the game's pointer (touch blocks, stunning enemies) is the Joy-Con gyro, which the host now feeds with real data ([Six-axis sensors](../../../docs/reference/services.md#six-axis-sensors)) but this game was brought up on the touch screen; handheld, it is the touch screen, which the iPhone front end feeds with the touches no gamepad control takes. Handheld also renders at 720p |
 | `pad_layout full` | `game.tsv` | the virtual gamepad starts in the 3D layout: the right stick turns the camera |
 | `feedback_snap 54f58a7cab608766` | `game.tsv` | agl's post-effect program samples its own attachment: 16x16 magenta blocks on the Mac too; see [Rendering](#rendering) |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | no system resource in the NPDM: the game sets a 3.00 GB heap (pool − 64 MB). `main`'s bss is only 1.4 MB. 13 Sentinels' partition, as the other EPD games without virtual address memory |
