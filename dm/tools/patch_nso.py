@@ -66,6 +66,55 @@ else:
 # live in a writable page appended after the key page; hle_cheat.c finds it through the fixups header and maintains the bytes
 # from toggles.txt and (for keypress-gated cheats) the held buttons, so a baked patch is switched at run time exactly like a
 # file cheat. Cheat-site bytes are asserted like any cut, so a table for the wrong build aborts the rewrite, not the game.
+def cheat_written(ws):
+    """The registers a pass through these words could write before a later store runs: the writer opcodes' destinations
+    (3 the loop counter, 4/5/7/9 load and arithmetic destinations, 6/A with the increment bit, C1 restore or clear, C2
+    a restore mask, C3 reading a static). The stream is decoded the way the executor decodes it (hle_cheat.c vm_decode's
+    shapes: an opcode, then its operand words), so a stored value is never misread as an opcode: BotW's 1.9.0 master
+    stores whole ARM instructions, and its values 0x51000529 / 0x71000508 read as 'load / arithmetic into r0', which
+    marked register 0 -- the no-offset register every plain store names -- written, and the whole table refused to bake.
+    An opcode shape the scan does not model, or an operand run cut past the end of the stream, marks every register: a
+    false write only refuses baking, never misplaces one."""
+    written, i, bad = set(), 0, False
+    while i < len(ws):
+        w = ws[i]; op = w >> 28; width = (w >> 24) & 0xF; i += 1
+        if op == 0x0: i += 3 if width == 8 else 2                        # store: address + value (a u64 in two words)
+        elif op == 0x1: i += 2 + (width == 8)                             # begin-cond: address + compared value
+        elif op == 0x2: pass                                              # end of block
+        elif op == 0x3: written.add((w >> 16) & 0xF); i += (w >> 24) & 0xF == 0   # loop counter; a start carries the count
+        elif op == 0x4: written.add((w >> 16) & 0xF); i += 2              # load immediate: a u64
+        elif op == 0x5: written.add((w >> 16) & 0xF); i += 1              # load from memory: its address
+        elif op == 0x6:                                                   # store register: the post-increment writes it
+            if (w >> 12) & 0xF: written.add((w >> 16) & 0xF)
+            i += 2                                                        # its value is a u64, whatever the width nibble
+        elif op == 0x7: written.add((w >> 16) & 0xF); i += 1              # arithmetic, immediate
+        elif op == 0x8: pass                                              # keypress condition
+        elif op == 0x9:                                                   # arithmetic register [immediate]
+            written.add((w >> 16) & 0xF)
+            if (w >> 8) & 0xF: i += 2 if width == 8 else 1
+        elif op == 0xA:                                                   # store register, memory region: post-increment writes reg2
+            if (w >> 12) & 0xF: written.add((w >> 16) & 0xF)
+            if (w >> 8) & 0xF in (2, 4, 5): i += 1                        # region forms with an address word
+        elif op == 0xC:
+            sub = (w >> 24) & 0xF
+            if sub == 0x0:                                                # register condition: an immediate compares u64 at width 8
+                if (w >> 8) & 0xF == 4: i += 2 if (w >> 20) & 0xF == 8 else 1
+            elif sub == 0x1:                                              # save / restore: a restore or clear writes the register
+                if (w >> 4) & 0xF in (0, 3): written.add((w >> 16) & 0xF)
+            elif sub == 0x2: written.update(range(0x10))                  # a restore / clear mask touches any register
+            elif sub == 0x3:                                              # static-register read into the register
+                if (w >> 4) & 0xFF < 0x80: written.add(w & 0xF)
+            elif sub == 0x4: i += 2                                       # extended keypress: its 64-bit mask
+            else: bad = True
+        elif op == 0xF:                                                   # only FF0 pause / FF1 resume / FFF log are defined
+            if (w >> 24) & 0xF != 0xF: bad = True
+            elif (w >> 20) & 0xF == 0xF:                                  # log: one address word when it reads memory
+                if (w >> 8) & 0xF in (0, 2): i += 1
+            elif (w >> 20) & 0xF > 1: bad = True
+        else: bad = True
+        if bad: break
+    if bad or i > len(ws): written.update(range(0x10))                    # unknown shape or truncated operands: refuse baking
+    return written
 CHEAT_SRC = os.environ.get('DM_CHEAT_FILE') if NAME == 'main' else None
 CHEAT_BAKE, FLAGS_PAGE_OFF = [], 0
 if CHEAT_SRC:
@@ -99,21 +148,10 @@ if CHEAT_SRC:
             j = bake_txt.find('\n', i)
             i = len(bake_txt) if j < 0 else j
     # A store through offset register R lands at a fixed main+rel only if nothing in the file ever writes v_r[R]: every
-    # pass starts with the registers cleared, and only the file's own opcodes can set one before the store runs. Scan
-    # every word of every cheat: any word that decodes as a register-writing opcode counts its register as written,
-    # operand words misread as opcodes included -- a false write only refuses baking, never misplaces one. Writers:
-    # 3 (the loop counter), 4/5/7/9 (load and arithmetic destinations), 6/A with the increment bit (post-increment),
-    # C1 restore, C2 restore-mask (any register), C3 reading a static register.
+    # pass starts with the registers cleared, and only the file's own opcodes can set one before the store runs (the
+    # master and every enabled cheat share one assembled program, so every cheat's writes count, cheat_written below).
     written = set()
-    for ch in parsed:
-        for w in ch['words']:
-            op = w >> 28
-            if op in (0x3, 0x4, 0x5, 0x7, 0x9) or (op in (0x6, 0xA) and (w >> 12) & 0xF): written.add((w >> 16) & 0xF)
-            if op == 0xC:
-                sub = (w >> 24) & 0xF
-                if sub == 0x1: written.add((w >> 16) & 0xF)
-                elif sub == 0x2: written.update(range(0x10))
-                elif sub == 0x3: written.add(w & 0xF)
+    for ch in parsed: written |= cheat_written(ch['words'])
     for ch in parsed:
         if ch['master'] or not ch['words'] or bake_off.get(ch['name']): continue   # the master block only restores baselines; the stub's off path is the original
         mask, sites, cave, k, ok = 0, {}, {}, 0, True
