@@ -2,6 +2,7 @@
 .iosdd/
 .iosdd_mac/
 .iosdd_*/
+.zcode/
 .DS_Store
 __pycache__/
 # Made from each shader build's Mac outputs (c1_guard.py, cb_extent.py; the NSP script makes them), not committed
