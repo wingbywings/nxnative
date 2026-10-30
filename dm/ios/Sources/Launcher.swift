@@ -6,6 +6,9 @@ import SwiftUI
 import UIKit
 import os
 
+@_silgen_name("dm_launcher_cloud_transfer")
+private func cloudTransfer(_ restoring: Int32, _ completion: @convention(block) (NSString) -> Void)
+
 private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
 
 private extension LauncherModel {
@@ -68,6 +71,10 @@ private struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let play: () -> Void
     @State private var memory = os_proc_available_memory()
+    @State private var cloudBusy = false
+    @State private var cloudMessage = "Only save and cheats are included. Playing uses local saves and does not require iCloud."
+    @State private var confirmCloud = false
+    @State private var restoreCloud = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -93,6 +100,15 @@ private struct LauncherView: View {
                         }
                     }
                     Section {
+                        Button("Back up to iCloud") { restoreCloud = false; confirmCloud = true }
+                        Button("Restore from iCloud") { restoreCloud = true; confirmCloud = true }
+                        if cloudBusy { ProgressView("Working…") }
+                    } header: {
+                        Text("iCloud saves")
+                    } footer: {
+                        Text(cloudMessage)
+                    }
+                    Section {
                         Button("Reset to tested defaults") { m.reset() }
                             .disabled(!m.changed)
                     } footer: {
@@ -111,12 +127,31 @@ private struct LauncherView: View {
                 .frame(width: geometry.size.width * 2 / 3)
             }
         }
+        .disabled(cloudBusy)
+        .alert(restoreCloud ? "Restore from iCloud?" : "Back up to iCloud?", isPresented: $confirmCloud) {
+            Button("Cancel", role: .cancel) {}
+            Button(restoreCloud ? "Restore" : "Back up", role: .destructive) { transferCloud() }
+        } message: {
+            Text(restoreCloud
+                 ? "Replace this device's save and cheats folders with the iCloud backup? Previous local copies will be retained. Other files are untouched."
+                 : "Replace this game's iCloud backup with this device's save and cheats folders? Local files will be kept.")
+        }
         .preferredColorScheme(.dark)
         .task {
             while !Task.isCancelled {
                 memory = os_proc_available_memory()
                 try? await Task.sleep(for: .seconds(2))
             }
+        }
+    }
+
+    private func transferCloud() {
+        guard !cloudBusy else { return }
+        cloudBusy = true
+        cloudMessage = restoreCloud ? "Downloading and restoring save and cheats…" : "Backing up save and cheats…"
+        cloudTransfer(restoreCloud ? 1 : 0) { message in
+            cloudMessage = message as String
+            cloudBusy = false
         }
     }
 

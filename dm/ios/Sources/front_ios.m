@@ -11,7 +11,6 @@
 #include "haptics_apple.h"
 #include "hle_cheat.h"
 #import "cloud_save.h"
-void dm_cloud_show_gate(UIViewController *parent, void (^done)(void));
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
@@ -121,10 +120,8 @@ static void launcher_done(void) { dm_cloud_configuration_changed(); [g_root star
     [super viewDidAppear:a];
     if (self.launched || !front_ios_boot_ok()) return;
     self.launched = YES; g_root = self;
-    // Offer optional migration; continuing locally performs no iCloud checks.
-    dm_cloud_show_gate(self, ^{
-        if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];
-    });
+    // Cloud actions are optional rows in the launcher; local play never probes iCloud.
+    if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];
 }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
