@@ -963,8 +963,11 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, nsp_dir, provisional=False):
     names = list(src)
     cheat_file = None   # cheat patches baked in from the game folder's cheat file (code-write cheats cannot run at run time on iOS)
     if 'main' in mods: cheat_file = cheat_table_for(nsp_dir, exe_dir / 'main')
+    # toggles.txt beside the table decides WHICH cheats bake, so it belongs in the reuse key: without it a run after the game
+    # wrote toggles.txt (the menu persists switches into the game folder's cheats on the Mac) would reuse a stale patched.bin
+    cheat_toggles = cheat_file.with_name('toggles.txt') if cheat_file and (cheat_file.parent / 'toggles.txt').is_file() else None
     kf = out.with_name(out.name + '.key')
-    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py', 'nso_match.py')] + patch_files(repo, exe_dir, mods, env.get('DM_GAME')) + list(src.values()) + ([manifest] if manifest.is_file() else []) + ([cheat_file] if cheat_file else [])), names, capstone.__version__,
+    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py', 'nso_match.py')] + patch_files(repo, exe_dir, mods, env.get('DM_GAME')) + list(src.values()) + ([manifest] if manifest.is_file() else []) + ([cheat_file] if cheat_file else []) + ([cheat_toggles] if cheat_toggles else [])), names, capstone.__version__,
                       {k: env.get(k) for k in ('DM_PATCH_FRONT', 'DM_GAME')})
     if all((out / f'{m}.patched.bin').is_file() for m in names) and reused(kf, key) is not None:
         PROG.end(f'{", ".join(mods)}{f" and {len(nros)} NROs" if nros else ""}, reused (inputs unchanged)'); return g

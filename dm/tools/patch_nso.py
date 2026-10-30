@@ -59,6 +59,41 @@ else:
     KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
     IMG.extend(bytes(0x4000))
 
+# ---- Data references: every word the game reads as data, found before anything rewrites the image ----
+# A literal pool sits interleaved with the code (TotK 1.4.3 keeps its 1/30 s per-frame time step, 0x3D088889, at main+0x2d01d70,
+# read by 178 adrp+ldr sites). Such a word is not an instruction and not free space: a cheat baked over it leaves every reader
+# loading the branch word as the constant (a denormal poison), and any pass that borrows the pool clobbers live constants.
+# The map holds the pristine word for each referenced offset: the cheat bake refuses those sites, and the final check below
+# asserts no pass changed one outside a registered cut.
+from array import array as _array
+DATA_REFS = {}
+_dw = _array('I'); _dw.frombytes(bytes(IMG[:TEXT_END & ~3]))
+def _dref(off):
+    if 0 <= off < KEY_PAGE_OFF - 3 and off not in DATA_REFS: DATA_REFS[off] = bytes(IMG[off:off + 4])
+for _i in range(len(_dw)):
+    _w0 = _dw[_i]
+    if _w0 & 0x9F000000 == 0x90000000:                      # adrp Xd, page
+        _rd = _w0 & 0x1F
+        _imm = ((_w0 >> 5) & 0x7FFFF) << 2 | (_w0 >> 29) & 3
+        if _imm & 0x100000: _imm -= 0x200000
+        _page = (_i * 4 & ~0xFFF) + (_imm << 12)
+        for _j in range(_i + 1, min(_i + 9, len(_dw))):
+            _wj = _dw[_j]
+            if _wj >> 24 in (0x14, 0x15, 0x16, 0x17, 0x94, 0x95, 0x96, 0x97,   # a branch ends the straight-line window
+                             0x34, 0xB4, 0x36, 0xB6, 0x54, 0xD6): break
+            if _wj & 0x1F == _rd and (_wj & 0x9F000000 == 0x90000000 or          # the base register is set again
+                                       (_wj & 0xFF800000) == 0xD2800000 or (_wj & 0x7F800000) == 0x52800000): break
+            if _wj >> 5 & 0x1F == _rd:                       # ldr Xt/Wt/Dt/St, [base, #imm]: a literal-pool or data load
+                if   _wj & 0xFFC00000 == 0xF9400000: _dref(_page + ((_wj >> 10) & 0xFFF) * 8)
+                elif _wj & 0xFFC00000 == 0xB9400000: _dref(_page + ((_wj >> 10) & 0xFFF) * 4)
+                elif _wj & 0xFFC00000 == 0xFD400000: _dref(_page + ((_wj >> 10) & 0xFFF) * 8)
+                elif _wj & 0xFFC00000 == 0xBD400000: _dref(_page + ((_wj >> 10) & 0xFFF) * 4)
+    elif _w0 >> 24 in (0x18, 0x58, 0x98, 0x1D, 0x5D, 0xDD):  # ldr Wt/XT/WSt/DT/QT, label: a pc-relative literal load
+        _imm = (_w0 >> 5) & 0x7FFFF
+        if _imm & 0x40000: _imm -= 0x80000
+        _dref(_i * 4 + _imm * 4)
+del _dw, _dref
+
 # ---- Cheat patches (DM_CHEAT_FILE, module main only): Atmosphère-format code-write cheats baked in as toggleable patches ----
 # On iOS the sealed code pages cannot be written at run time, so a code-patch cheat cannot run from the cheat file. Instead the
 # build turns each enabled "store u32 at main+off" cheat into: the site instruction becomes a branch to a patch-area stub that
@@ -97,8 +132,10 @@ def cheat_written(ws):
             if (w >> 8) & 0xF in (2, 4, 5): i += 1                        # region forms with an address word
         elif op == 0xC:
             sub = (w >> 24) & 0xF
-            if sub == 0x0:                                                # register condition: an immediate compares u64 at width 8
-                if (w >> 8) & 0xF == 4: i += 2 if (w >> 20) & 0xF == 8 else 1
+            if sub == 0x0:                                                # register condition: memory address or compared immediate
+                comp = (w >> 8) & 0xF
+                if comp in (0, 2): i += 1                                # region+offset / register+offset: one address word
+                elif comp == 4: i += 2 if (w >> 20) & 0xF == 8 else 1
             elif sub == 0x1:                                              # save / restore: a restore or clear writes the register
                 if (w >> 4) & 0xF in (0, 3): written.add((w >> 16) & 0xF)
             elif sub == 0x2: written.update(range(0x10))                  # a restore / clear mask touches any register
@@ -172,6 +209,24 @@ if CHEAT_SRC:
             dst = sites if rel < len(IMG) else cave              # code past the image is the cheat's own cave
             if width == 8: dst[rel] = val & 0xFFFFFFFF; dst[rel + 4] = val >> 32   # a u64 store is little-endian: its low word lands at rel (two instruction slots, one flag)
             else: dst[rel] = val
+        # A hold-gated cheat's else branch writes the ORIGINAL words back (that is how it untoggles on the Switch). Every one
+        # must match this build's image: a table for another build would bake its sites over whatever stands there. TotK's
+        # glider family restores 0x3D088889 (the 1/30 s time step) at main+0x2d01d70, a literal-pool float, not code.
+        if mask and ok and k < len(ws) and ws[k] >> 28 == 0x2 and (ws[k] >> 24) & 0xF == 1:
+            r, bad = k + 1, False
+            while r < len(ws):
+                w = ws[r]
+                if w >> 28 == 0x2: break                         # the block's end marker
+                if w >> 28 != 0x0: bad = True; break             # anything but a plain store: no original words to check
+                width, mem, ofs = (w >> 24) & 0xF, (w >> 20) & 0xF, (w >> 16) & 0xF
+                if mem != 0 or ofs in written or width not in (4, 8) or r + (4 if width == 8 else 3) > len(ws): bad = True; break
+                rel = ((w & 0xFF) << 32) | ws[r + 1]
+                val = ((ws[r + 2] << 32) | ws[r + 3]) if width == 8 else ws[r + 2]
+                r += 4 if width == 8 else 3
+                have = struct.unpack_from('<I', IMG, rel)[0] if rel + 4 <= len(IMG) else None
+                assert have == (val & 0xFFFFFFFF), \
+                    f'cheat file: "{ch["name"]}" restores {val & 0xFFFFFFFF:08x} at main+{rel:#x}, but this build holds ' \
+                    f'{have if have is not None else 0:08x} there: the table is for another build'
         if not ok or not sites:
             print(f'    cheat "{ch["name"]}": not bakeable (only u32/u64 stores at main+off), left to the run-time engine')
             continue
@@ -183,6 +238,11 @@ if CHEAT_SRC:
         for off in sites: site_owner[off] = ch
         ch.update(mask=mask, sites=sites, cave=cave)
         CHEAT_BAKE.append(ch)
+    CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c['sites']]
+    for ch in CHEAT_BAKE:                                        # a site the game reads as data is not an instruction: a baked branch
+        for off in [o for o in ch['sites'] if o in DATA_REFS]:   # there would be loaded as the constant by every reader
+            print(f'    cheat "{ch["name"]}": site {off:#x} is a data word the game reads (a literal-pool constant), not baked; the run-time engine toggles it')
+            del ch['sites'][off]
     CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c['sites']]
     assert len(CHEAT_BAKE) <= 0x40, \
         f'cheat file: {len(CHEAT_BAKE)} bakeable cheats exceed the flags page\'s {0x40} records (hle_cheat.c BAKED_MAX)'
@@ -1533,6 +1593,24 @@ if CHEAT_BAKE:
     assert not FS_STATE_OFF or FLAGS_PAGE_OFF >= FS_STATE_OFF + 0x4000, 'cheat flags page overlaps the frame step state page'
     if dropped: print(f'    cheat patches not baked: {", ".join(dropped)}')
     print(f'    cheat patches: {len(CHEAT_BAKE)} baked (flags page at +{FLAGS_PAGE_OFF:#x}, toggled by the run-time cheat engine)')
+
+# ---- Final verification of the finished image ----
+# Every cut's new bytes must still be in place: a later pass may not silently overwrite one (TotK's №21 glider cut was eaten
+# this way and its stub left orphaned). And no word the game reads as data may differ from its pristine value unless a
+# registered cut covers it: a rewrite pass that borrows a literal pool poisons live constants (the same game's 1/30 s time
+# step, loaded by 178 sites, reached the players as -6.2e34 and every forward jump and Ultrahand move was rejected as NaN).
+for _c in cuts:
+    _nb = bytes.fromhex(_c[2])
+    assert bytes(IMG[_c[0]:_c[0] + len(_nb)]) == _nb, f'cut at {_c[0]:#x} is not in the final image (a later pass overwrote it): {_c[3]}'
+import bisect as _bisect
+_cutspans = sorted((_c[0], _c[0] + len(bytes.fromhex(_c[2]))) for _c in cuts)
+_cutstarts = [s for s, _ in _cutspans]
+for _off in sorted(DATA_REFS):
+    _i = _bisect.bisect_right(_cutstarts, _off) - 1
+    if _i >= 0 and _off < _cutspans[_i][1]: continue            # a registered cut may change it
+    _now = bytes(IMG[_off:_off + 4])
+    assert _now == DATA_REFS[_off], (f'data word at {_off:#x} changed from {DATA_REFS[_off].hex()} to {_now.hex()} by a rewrite '
+        'pass: the game reads this word as data (a literal-pool or table constant), and only a registered cut may change it')
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
 if FAR:   # patch area before the base: file = text + ro + data (padded to 16K) + patch area
     if BIG_TEXT and len(patch) > FRONT - 0x4000 and 'DM_PATCH_FRONT' not in os.environ:

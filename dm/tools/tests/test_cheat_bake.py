@@ -62,6 +62,38 @@ class WrittenScan(unittest.TestCase):
         # the word after a keypress mask is an opcode again: this one is a real load into r0
         self.assertEqual(cheat_written([0x80000000, 0x51000529, 0x00102030]), {0})
 
+    def test_register_memory_condition_preserves_following_writer(self):
+        for comp in (0, 2):
+            with self.subTest(comp=comp):
+                # Nested conditions, then rA = 0x10. Missing C0's address word makes the scanner treat
+                # 0x1000 and 0x10 as stores and swallow the load and both end markers, reporting no writes.
+                master = [0x80000000, 0xC0450000 | comp << 8, 0x1000,
+                          0x400A0000, 0, 0x10, 0x20000000, 0x20000000]
+                written = cheat_written(master) | cheat_written(store(0x100, 0xD503201F, ofs=0xA))
+                self.assertEqual(written, {0xA})  # refuse baking at +0x100: the store can target +0x110
+
+    def test_register_memory_condition_address_is_not_an_opcode(self):
+        for comp in (0, 2):
+            for width in (4, 8):
+                with self.subTest(comp=comp, width=width):
+                    words = [0xC0050000 | width << 20 | comp << 8, 0x51000529, 0x20000000]
+                    self.assertEqual(cheat_written(words), set())
+
+    def test_register_condition_other_operand_shapes(self):
+        for comp, width, operands in [(comp, 4, []) for comp in (1, 3, 5)] + [
+            (4, width, [0x51000529] if width != 8 else [0x51000529, 0x71000508])
+            for width in (1, 2, 4, 8)
+        ]:
+            with self.subTest(comp=comp, width=width):
+                words = [0xC0050000 | width << 20 | comp << 8] + operands + [
+                    0x400A0000, 0, 0x10, 0x20000000]
+                self.assertEqual(cheat_written(words), {0xA})
+
+    def test_register_memory_condition_truncated_address_refuses_baking(self):
+        for comp in (0, 2):
+            with self.subTest(comp=comp):
+                self.assertEqual(cheat_written([0xC0450000 | comp << 8]), set(range(0x10)))
+
     def test_unknown_or_truncated_marks_every_register(self):
         for words in ([0xB0000000], [0xD1000000], [0xC5000000], [0xF2000000], [0xFFF20000],   # undefined opcodes
                       [0x04000000], [0x04000000, 0x1234]):                                    # operands cut off
