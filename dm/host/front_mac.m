@@ -12,6 +12,7 @@
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
+#import "cloud_save.h"
 #include "hle.h"
 #include "pad_slots.h"
 #include "haptics_apple.h"
@@ -241,6 +242,10 @@ void front_run(void (*guest)(void)) {
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
         NSView *v = win.contentView = [[DmGameView alloc] initWithFrame:r];
+        dm_cloud_status_handler(^(NSString *message, BOOL failed) {
+            win.subtitle = message;
+            if (failed) NSAccessibilityPostNotification(win, NSAccessibilityTitleChangedNotification);
+        });
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();

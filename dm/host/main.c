@@ -1,6 +1,7 @@
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
 #include "front.h"
+#include "cloud_save.h"
 #include <stdatomic.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -95,7 +96,7 @@ static void host_preload(int argc, char **argv) {
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
-    { void cheat_start(void); cheat_start(); }   // Atmosphère-format cheat engine (hle_cheat.c): keyed by main's build ID, just loaded
+
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE probes (for diagnostics)
     hid_keys_init();   // DM_KEYS scripted input
@@ -124,6 +125,7 @@ void dm_host_preload_start(int argc, char **argv) {
 }
 int main(int argc, char **argv) {
     { int mtl_pso_prebuild_tool(void); if (mtl_pso_prebuild_tool()) return 0; }   // DM_PSO_PREBUILD=tool: the pipeline archive's prebuild alone, no game (nvn_mtl.m)
+    if (!dm_cloud_prepare()) return 1;   // before any SDK initialization or save mount
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {
         pthread_join(g_pre.th, NULL);
@@ -133,6 +135,7 @@ int main(int argc, char **argv) {
         LOG("host loading already finished early in the background (dm_host_preload_start)");
     } else host_preload(argc, argv);
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
+    { void cheat_start(void); cheat_start(); }   // Atmosphère-format cheat engine (hle_cheat.c): keyed by main's build ID, just loaded
     front_run(guest_main);
     return 0;
 }

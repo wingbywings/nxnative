@@ -10,6 +10,8 @@
 #include "dm.h"
 #include "haptics_apple.h"
 #include "hle_cheat.h"
+#import "cloud_save.h"
+void dm_cloud_show_gate(UIViewController *parent, void (^done)(void));
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
@@ -46,11 +48,12 @@ static UILabel *front_ios_fps_label(void);
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
+@property (nonatomic, strong) UILabel *cloudStatus;
 @property (nonatomic) BOOL launched;
 - (void)startGame;
 @end
 static DmRootVC *g_root;
-static void launcher_done(void) { [g_root startGame]; }
+static void launcher_done(void) { dm_cloud_configuration_changed(); [g_root startGame]; }
 @implementation DmRootVC
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -64,6 +67,25 @@ static void launcher_done(void) { [g_root startGame]; }
         [self.view addSubview:lb]; return;
     }
     front_ios_audio_watch();
+    self.cloudStatus = [UILabel new];
+    self.cloudStatus.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+    self.cloudStatus.adjustsFontForContentSizeCategory = YES;
+    self.cloudStatus.textColor = UIColor.whiteColor; self.cloudStatus.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+    self.cloudStatus.numberOfLines = 0; self.cloudStatus.textAlignment = NSTextAlignmentCenter;
+    self.cloudStatus.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.cloudStatus];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.cloudStatus.centerXAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.centerXAnchor],
+        [self.cloudStatus.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8],
+        [self.cloudStatus.widthAnchor constraintLessThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.widthAnchor multiplier:0.65]
+    ]];
+    __weak DmRootVC *weakSelf = self;
+    dm_cloud_status_handler(^(NSString *message, BOOL failed) {
+        DmRootVC *root = weakSelf;
+        root.cloudStatus.text = message;
+        root.cloudStatus.accessibilityLabel = [@"iCloud save: " stringByAppendingString:message];
+        if (failed) UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, message);
+    });
 }
 // The game view, the pad and the frame-rate counter are made once the launcher has set the switches they read (DM_SHOW_FPS, DM_METAL_HUD); the host's loading began at app launch (main.m)
 - (void)startGame {
@@ -79,6 +101,7 @@ static void launcher_done(void) { [g_root startGame]; }
     [self.view addSubview:self.pad];
     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
     if (self.fps) [self.view addSubview:self.fps];
+    [self.view bringSubviewToFront:self.cloudStatus];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     front_ios_boot();
@@ -98,7 +121,10 @@ static void launcher_done(void) { [g_root startGame]; }
     [super viewDidAppear:a];
     if (self.launched || !front_ios_boot_ok()) return;
     self.launched = YES; g_root = self;
-    if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];   // the settings screen first (Launcher.swift), when the app has one
+    // Offer optional migration; continuing locally performs no iCloud checks.
+    dm_cloud_show_gate(self, ^{
+        if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];
+    });
 }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits

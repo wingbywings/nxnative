@@ -728,11 +728,15 @@ int cheat_menu_count(void) {
 // every row's state is written back on a menu toggle, and the next boot starts from exactly that file
 static char g_tdir[1100];
 
+__attribute__((weak)) void dm_cloud_configuration_changed(void) {}
 static void toggles_save_locked(void) {       // caller holds g_mu
     if (!g_tdir[0]) return;
     char path[1100];
     snprintf(path, sizeof path, "%s/toggles.txt", g_tdir);
-    FILE *f = fopen(path, "w");
+    char temporary[1120]; snprintf(temporary, sizeof temporary, "%s/cheat-toggles-XXXXXX", getenv("DM_TEMP") ?: g_tdir);
+    int temporary_fd = mkstemp(temporary);
+    FILE *f = temporary_fd >= 0 ? fdopen(temporary_fd, "w") : NULL;
+    if (!f && temporary_fd >= 0) { close(temporary_fd); unlink(temporary); }
     if (!f) { LOG("[RED] cheat: cannot write %s (menu switches will not survive a restart)", path); return; }
     fputs("# cheat switches, written by the game when you flip one (edit while playing: picked up within a second)\n", f);
     for (int i = 0; i < (g_nbaked > 0 ? g_nbaked : 0); i++) {
@@ -745,7 +749,10 @@ static void toggles_save_locked(void) {       // caller holds g_mu
         if (!g_ent[k].def.n || baked_named(g_ent[k].def.name)) continue;
         fprintf(f, "[%s] %s\n", g_ent[k].def.name, g_ent[k].enabled ? "on" : "off");
     }
-    fclose(f);
+    int failed = ferror(f);
+    if (fclose(f)) failed = 1;
+    if (!failed && !rename(temporary, path)) dm_cloud_configuration_changed();
+    else { unlink(temporary); LOG("[RED] cheat: cannot publish switches"); }
 }
 
 // One row: the name and the effective state (a keypress-gated patch reads off until its buttons are held)
@@ -903,7 +910,7 @@ static void *cheat_thread(void *arg) {
         time_t c = mtime_of(cpath), t = mtime_of(tpath);
         if (c != cm) {
             cm = c; tm = t;
-            if (cheat_reload(dir)) ever_loaded = 1;
+            if (cheat_reload(dir)) { ever_loaded = 1; dm_cloud_configuration_changed(); }
             else if (!ever_loaded) LOG("cheat: no cheat file for build %s (looked for %s), cheats off", bid, cpath);
             else LOG("cheat: cheat file gone or rejected, cheats off until it returns");
         } else {
@@ -911,7 +918,7 @@ static void *cheat_thread(void *arg) {
                 tm = t;
                 size_t tn;
                 char *s = read_file(tpath, &tn);
-                if (s) { parse_toggles(s, tn); v_dirty = 1; LOG("cheat: toggles reloaded, %d enabled", cheat_enabled_count()); }
+                if (s) { parse_toggles(s, tn); v_dirty = 1; LOG("cheat: toggles reloaded, %d enabled", cheat_enabled_count()); dm_cloud_configuration_changed(); }
             }
             cheat_baked_pump();                             // baked patch flags: they act even with no cheat file at all
             cheat_execute();

@@ -15,6 +15,7 @@ static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off);
 #include "../hle_fs.c"
 #undef pwrite
 ssize_t pwrite(int, const void *, size_t, off_t);
+extern int g_cloud_commits;
 
 struct dm_flags g_flag; uint64_t g_t0_ns; uint64_t now_ns(void) { return 0; }   // stubs for log timestamps and the read path (not used by the write path)
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
@@ -72,10 +73,12 @@ int main(void) {
 
     printf("③ transaction\n");
     CHECK(h_fs_Commit("save") == RES_FAIL && g_nfail == 1 && g_lasterr == ENOSPC, "the Commit of the transaction holding ①② is refused, front end notified once errno=ENOSPC (actually %d times errno=%d)", g_nfail, g_lasterr);
+    CHECK(g_cloud_commits == 0, "a refused transaction is never sent to cloud sync");
     snprintf(p, sizeof p, "%s/a", work); CHECK(same(p, "old"), "work directory discarded, back to the committed version old");
     CHECK(write_save("save:/a", "new") == RES_OK, "next transaction: write new");
     snprintf(p, sizeof p, "%s/a", save); CHECK(same(p, "old"), "before Commit the committed directory is still old");
     CHECK(h_fs_Commit("save") == RES_OK, "Commit");
+    CHECK(g_cloud_commits == 1, "a successful atomic commit is captured once for cloud sync");
     CHECK(same(p, "new"), "after Commit the committed directory is new");
     snprintf(p, sizeof p, "%s.new", save); CHECK(access(p, F_OK) != 0, "the swapped-out old version is deleted (no .new left)");
 

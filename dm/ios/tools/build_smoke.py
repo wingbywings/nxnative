@@ -63,8 +63,9 @@ def main():
 
     config = run(sys.executable, ios / 'tools/gen_build.py', REPO / 'dm/host', gen, capture=True).stdout
     flags = run(sys.executable, ios / 'tools/gen_embed.py', patched, gen / 'embed.S', *modules, capture=True).stdout.strip()
-    (gen / 'dm.xcconfig').write_text(config + f'OTHER_LDFLAGS = $(inherited) $(DM_FRAMEWORKS) {flags}\n')
+    (gen / 'dm.xcconfig').write_text(config + f'OTHER_LDFLAGS = $(inherited) $(DM_FRAMEWORKS) {flags}\nCODE_SIGN_ENTITLEMENTS = Gen/DmIOS.entitlements\n')
     run('xcodegen', 'generate')
+    run(sys.executable, ios / 'tools/gen_icloud.py', gen, '--bundle-id', env['DM_BUNDLE_ID'], '--name', env['DM_DISPLAY_NAME'])
 
     # Exercise the real resource-copy phase with tiny, clearly synthetic data.
     romfs = root / 'romfs'
@@ -89,6 +90,10 @@ def main():
 
     app = derived / 'Build/Products/Release-iphoneos/DmIOS.app'
     info = plistlib.loads((app / 'Info.plist').read_bytes())
+    cloud = info.get('DMICloudContainerIdentifier')
+    grants = plistlib.loads((app / 'dm/iCloud.entitlements').read_bytes())
+    if cloud != 'iCloud.com.oops.game' or cloud not in grants['com.apple.developer.ubiquity-container-identifiers']:
+        raise RuntimeError('The iCloud runtime identifier and signing requirements do not match')
     executable = app / info['CFBundleExecutable']
     if not executable.is_file():
         raise RuntimeError(f'No linked executable: {executable}')

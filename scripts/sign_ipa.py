@@ -10,6 +10,7 @@
 #                            profile exported by a sideloading tool
 #   --identity <name | auto | ->  the codesign identity (auto: the profile's certificate found in the keychain; '-' = ad-hoc, for TrollStore, no profile needed)
 #   --bundle-id <id>          rewrite CFBundleIdentifier to fit a profile made for another ID (another ID is another app on the device, with its own saves)
+#   --icloud-container <id>   use this provisioned container; default for cloud-enabled apps: iCloud.com.oops.game
 #   --memory-limit            add com.apple.developer.kernel.increased-memory-limit: iOS gives about 3.4 GB without it and closes the bigger games. An
 #                            entitlement the profile does not list may make a normal install refuse the app (TrollStore does not care)
 #   --entitlements <plist>    merge these keys on top of the generated ones (a per-app override, or extra keys for TrollStore)
@@ -141,6 +142,35 @@ def build_entitlements(profile, bundle, extras, memory_limit):
         ent['com.apple.developer.kernel.increased-memory-limit'] = True
     for f in extras: ent.update(plistlib.load(open(f, 'rb')))
     return ent
+
+
+def configure_icloud(info, entitlements, profile, bundle, container=None):
+    """Use one concrete container in runtime metadata and the final signature."""
+    if not info.get('DMICloudContainerIdentifier') and not container:
+        return None
+    container = container or 'iCloud.com.oops.game'
+    if not re.fullmatch(r'iCloud\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*', container):
+        die('invalid iCloud container identifier: ' + container)
+    keys = ('com.apple.developer.icloud-container-identifiers',
+            'com.apple.developer.ubiquity-container-identifiers')
+    grants = profile.get('Entitlements', {}) if profile else {}
+    for key in keys:
+        if container not in grants.get(key, []):
+            die(f'the profile must explicitly authorize {container} in {key}; associate this container with {bundle} in Apple Developer and regenerate the profile')
+    services = grants.get('com.apple.developer.icloud-services', [])
+    if services != '*' and 'CloudDocuments' not in services and '*' not in services:
+        die('the profile does not authorize iCloud Documents (CloudDocuments)')
+    old = info.get('DMICloudContainerIdentifier')
+    details = dict(info.get('NSUbiquitousContainers', {}).get(old, {}))
+    details.update(NSUbiquitousContainerIsDocumentScopePublic=True,
+                   NSUbiquitousContainerSupportedFolderLevels='Any')
+    details.setdefault('NSUbiquitousContainerName', info.get('CFBundleDisplayName', bundle))
+    info['DMICloudContainerIdentifier'] = container
+    info['NSUbiquitousContainers'] = {container: details}
+    for key in keys:
+        entitlements[key] = [container]
+    entitlements['com.apple.developer.icloud-services'] = ['CloudDocuments']
+    return container
 
 
 # ---- extraction: the app's entries from the archive to disk (files inflate on a thread pool, timestamps and modes as stored) ----
@@ -318,6 +348,7 @@ def main():
     ap.add_argument('--profile', default='auto', help='a .mobileprovision to embed, or auto (the newest valid one that covers the bundle ID)')
     ap.add_argument('--identity', default='auto', help='a codesign identity by name or SHA-1, auto (the profile certificate in the keychain), or - (ad-hoc)')
     ap.add_argument('--bundle-id', help='rewrite the app bundle ID (to fit a profile made for another ID)')
+    ap.add_argument('--icloud-container', help='iCloud Documents container (default for cloud-enabled apps: iCloud.com.oops.game)')
     ap.add_argument('--memory-limit', action='store_true', help='add com.apple.developer.kernel.increased-memory-limit (the bigger games need it)')
     ap.add_argument('--entitlements', action='append', default=[], metavar='PLIST', help='merge these keys on top of the generated entitlements')
     ap.add_argument('--no-file-sharing', dest='file_sharing', action='store_false',
@@ -352,13 +383,15 @@ def main():
         if not covers(profile, bundle): die(f'the profile {profile.get("Name")} covers {profile["Entitlements"].get("application-identifier")}, not {bundle}')
         if profile['ExpirationDate'].astimezone() < datetime.now().astimezone(): die(f'the profile {profile.get("Name")} expired {profile["ExpirationDate"].date()}')
         print(f'  profile: {profile.get("Name")} ({profile["TeamIdentifier"][0]}, expires {profile["ExpirationDate"].date()})')
+    ent = build_entitlements(profile, bundle, a.entitlements, a.memory_limit)
+    cloud = configure_icloud(pl, ent, profile, bundle, a.icloud_container)
+    if cloud: print(f'  iCloud container: {cloud} (runtime metadata and signing entitlements)')
     ids = keychain_identities()
     if a.identity == '-': identity = '-'
     elif a.identity == 'auto': identity = pick_identity(profile, ids)
     else:
         identity = next((n for h, n in ids if a.identity in n or h.upper().startswith(a.identity.upper())), None) or die(
             f'no signing identity matching "{a.identity}":\n  ' + '\n  '.join(n for _, n in ids))
-    ent = build_entitlements(profile, bundle, a.entitlements, a.memory_limit)
     if profile and identity != '-':   # a signature by a certificate the profile does not list is valid yet uninstalled by any device (the 12:17 package)
         certs = {hashlib.sha1(c).hexdigest().upper() for c in profile.get('DeveloperCertificates', [])}
         leaf = next((h for h, n in ids if n == identity), None)
@@ -383,6 +416,12 @@ def main():
         shutil.rmtree(app_dir / '_CodeSignature', ignore_errors=True)   # codesign --force rewrites it; a stale one must not stay
         with open(app_dir / 'Info.plist', 'rb') as f: pl = plistlib.load(f)
         edits = []
+        if cloud:
+            configure_icloud(pl, ent, profile, bundle, cloud)
+            edits.append(f'iCloud container → {cloud}')
+            required = app_dir / 'dm/iCloud.entitlements'
+            required.parent.mkdir(parents=True, exist_ok=True)
+            required.write_bytes(plistlib.dumps({k: ent[k] for k in ('com.apple.developer.icloud-services', 'com.apple.developer.icloud-container-identifiers', 'com.apple.developer.ubiquity-container-identifiers')}))
         if a.bundle_id and a.bundle_id != pl['CFBundleIdentifier']:
             pl['CFBundleIdentifier'] = a.bundle_id; edits.append(f'bundle ID → {a.bundle_id}')
         if a.file_sharing:

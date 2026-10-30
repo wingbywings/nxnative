@@ -146,6 +146,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `t_fs_commit_list` injects write failures after truncation in either of two independent saves, verifies that the other save commits its changes, and checks failure propagation through aliases, rename failure handling, and a failed recovery clone. It blocks writes and size changes through an alias while another save commits, then verifies that both Commit ABIs wait for the affected I/O and refuse its failure. `make -C dm/host/tests GAME=<title ID> fs-tsan` also checks concurrent first writes and failed file I/O concurrent with mounting another alias.
 - **Found on:** the [two-save host regression](../../dm/host/tests/t_fs_commit_list.c). [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) uses independent device and account saves.
 
+### Cloud save snapshots and the startup gate
+
+- **Symptom:** multi-file cloud transfers can expose incomplete saves; requiring cloud access prevents offline local play.
+- **Cause:** local atomic save transactions are not distributed transactions, and iCloud may be unavailable. A remote document may not have a local filesystem entry; treating a non-ubiquitous URL as registration in progress made Restore report an indefinite wait. Backup also returned at the first pending upload, leaving later slots and the completion record unwritten.
+- **Fix:** startup offers separate local-to-cloud backup and cloud-to-local restore actions, or immediate local play without an automatic cloud check. Restore preflights a complete revision set and preserves the old local directories before replacing them. The manual backup covers only each Title ID's raw `save` and `cheats` directories; other local data remains untouched. Pre-restore copies live in `Library/Application Support/RestoreBackups`. Backup queues all slots and the completion record without gating submission on server upload acknowledgement; its UI explicitly distinguishes submission from upload completion. Restore discovers the completion record with `NSMetadataQuery`; metadata uses the ordinary `nxnative-backup` directory instead of hidden `.sync`. Backup metadata and local journals validate complete transfers and retain pending progress. Games continue to read local Documents. See [iCloud save synchronization](../development.md#icloud-save-synchronization).
+- **Found on:** the [synthetic cloud-save regression](../../dm/host/tests/t_cloud_save.m); real two-device validation remains open.
+- **Open:** offline play can intentionally use an older local save. Concurrent devices may conflict; no automatic winner is chosen. Legacy flat snapshots are preserved rather than silently migrated.
+
 ### Save data size queries
 
 - **Symptom:** SIGSEGV at address 0 in `nn::fs::GetSaveDataSizeMax`, about 13 minutes into a new game.

@@ -9,6 +9,7 @@
 #   DM_CHEAT_TABLE=the game folder's cheat file for the packed build (the NSP script sets it; it goes to DmIOS.app/dm/cheats and is seeded into Documents/cheats at first launch)
 #   The app name is the game name in the base NSP's control data ($W/data/v0/control.nacp, else the one next to the RomFS), the app version is the display version in the packed game's control data (the one next to the RomFS:
 #   nx_extract saves the update's there when an update is packed, else the base game's), the bundle ID is org.nxnative.<base game title ID in lowercase> (DM_DISPLAY_NAME / DM_APP_VERSION / DM_BUNDLE_ID override them);
+#   DM_ICLOUD_CONTAINER=iCloud.<identifier> overrides the default iCloud.com.oops.game; final signing must provision this container.
 #   DM_METAL_CAPTURE=1 makes a development build that can write GPU frame captures (MetalCaptureEnabled in Info.plist, for the host's DM_GPU_CAPTURE switch);
 #   DM_SHOW_FPS=1 turns the frame-rate counter on (DMShowFPS in Info.plist; DM_SHOW_FPS in the app's Documents/env.txt overrides it on the phone);
 #   DM_LANG=<language code> is the game language (DMLanguage in Info.plist, default en-US; DM_LANG in the app's Documents/env.txt overrides it on the phone);
@@ -120,16 +121,17 @@ if [ -f "$ICON" ]; then
   echo "DM_APPICON = AppIcon" >> Gen/dm.xcconfig
   t "app icon: $ICON"
 else t "no app icon ($ICON not found): the home-screen icon stays blank"; fi
-# A prepared Xcode project is signed in Xcode, so it asks for the Increased Memory Limit capability the bigger games need (see the README); DM_ENTITLEMENTS=another plist, or empty for none.
-# The unsigned IPA has none: the install tool adds it.
-if [ "$PREPARE_XCODE" = YES ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then
-  if [ -n "${DM_ENTITLEMENTS:-}" ]; then cp "$DM_ENTITLEMENTS" Gen/DmIOS.entitlements || die "copy DM_ENTITLEMENTS"
-  else printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-    '<plist version="1.0"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/></dict></plist>' > Gen/DmIOS.entitlements || die "entitlements"; fi
-  echo "CODE_SIGN_ENTITLEMENTS = Gen/DmIOS.entitlements" >> Gen/dm.xcconfig
-  t "entitlements: $(plutil -convert json -o - Gen/DmIOS.entitlements)"
-fi
+# Every build declares its automatic iCloud Documents container. The unsigned
+# IPA still needs a signer/profile that grants these entitlements; declaring
+# them does not create a container in the developer account.
+echo "CODE_SIGN_ENTITLEMENTS = Gen/DmIOS.entitlements" >> Gen/dm.xcconfig
 xcodegen generate -q > /dev/null || die "xcodegen"
+CLOUD_ARGS=(Gen --bundle-id "$DM_BUNDLE_ID" --name "$DM_DISPLAY_NAME")
+if [ -n "${DM_ICLOUD_CONTAINER:-}" ]; then CLOUD_ARGS+=(--container "$DM_ICLOUD_CONTAINER"); fi
+if [ -n "${DM_ENTITLEMENTS:-}" ]; then CLOUD_ARGS+=(--base "$DM_ENTITLEMENTS")
+elif [ "${DM_ENTITLEMENTS-unset}" = "" ]; then CLOUD_ARGS+=(--no-memory-limit); fi
+python3 tools/gen_icloud.py "${CLOUD_ARGS[@]}" || die "iCloud configuration"
+t "iCloud signing requirements: Gen/DmIOS.entitlements (also packed as dm/iCloud.entitlements)"
 # DM_METAL_CAPTURE=1: a development build that may write GPU frame captures (MetalCaptureEnabled; the host's DM_GPU_CAPTURE switch writes them to Documents/gpu_captures)
 if [ "${DM_METAL_CAPTURE:-0}" = 1 ]; then /usr/libexec/PlistBuddy -c "Add :MetalCaptureEnabled bool true" Gen/Info.plist > /dev/null || die "MetalCaptureEnabled"; t "Metal frame capture: enabled (DM_METAL_CAPTURE=1)"; fi
 python3 tools/gen_resources.py "$IOS" "$ROMFS" "$MARKER" "$MSL_IOS/$MSLDIR" "$MSLDIR" "$AOC" "$XCODE_DD" "$DM/gfx/nvn/dmsh_chain.h" "$PSO" || die "generate Xcode resource paths"

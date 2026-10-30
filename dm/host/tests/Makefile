@@ -191,3 +191,10 @@ notify-scheduler: $(B)/t_notify_sched
 	$(B)/t_notify_sched
 	$(B)/t_notify_sched --all-peers
 run: notify-scheduler
+
+$(B)/t_cloud_save: t_cloud_save.m ../cloud_save.m ../cloud_save.h $(GAME_H) | $(B)
+	clang -O1 -g -fobjc-arc -Wall -Wextra -Werror $(GINC) -o $@ t_cloud_save.m -framework Cocoa -framework Network
+.PHONY: cloud-save
+cloud-save: $(B)/t_cloud_save
+	$(B)/t_cloud_save
+run: cloud-save

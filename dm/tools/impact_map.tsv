@@ -82,6 +82,7 @@ dm/host/hle_thread.c	svc:*	threads and synchronization
 dm/host/hle_svc.c	svc:*	SVCs
 dm/host/thread.c	svc:*	threads
 dm/host/main.c	*:*	the host's start
+dm/host/cloud_save.*	*:*	cloud save startup and committed snapshot synchronization
 dm/host/loader.c	*:*	module loading
 dm/host/hle.c	hle:*	the HLE tables
 dm/host/front_mac.m	present:*	the Mac front end

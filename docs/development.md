@@ -208,6 +208,27 @@ Reuse works as for the IPA. Each shader output has its own key, named after the 
 
 Relative output and variant paths are resolved from the terminal's working directory before the host starts in its run folder. Each metric's median and range use the runs that supplied it; a missing optional GPU or game-speed reading leaves a dash when no run supplied one. A failed launch releases `--lock` so another measurement can run. A lock whose process is gone, with no game running, is stale and removed.
 
+### iCloud save synchronization
+
+Game startup is local-first. The iOS startup screen provides **Back up to iCloud**, **Restore iCloud backup to this device**, and **Continue with local saves**. No cloud checks run for local play. The two transfer actions are manual and directional; playing does not automatically overwrite the cloud backup. While an explicit transfer is active, the buttons are disabled to prevent a restore from racing the running game.
+
+Backup copies only `Documents/save/` and `Documents/cheats/`, recursively, preserving their relative paths and files. No other local directory, cache, log, `save.zip`, device save or launcher preference is included. Both directories and their revision record are queued before returning; success means submitted to iCloud Drive, not confirmed uploaded. Restore validates both complete directories before replacing either one. It preserves previous copies in `Library/Application Support/RestoreBackups/<UUID>/` and attempts rollback if installation fails. All other Documents contents and launcher preferences remain unchanged.
+
+The shared container is `iCloud.com.oops.game`. Its visible layout is:
+
+```text
+<base title ID>/
+  save/
+  cheats/
+  nxnative-backup/    # revision and recovery metadata
+```
+
+The game always reads local `Documents/save`. Each game is isolated by Title ID, independently of its signing Bundle ID. Restore discovers the completion record through `NSMetadataQuery`, then validates downloaded files against the committed snapshots. Incomplete transfers cannot replace local progress. Older cloud backups containing additional directories are accepted if their save and cheats revisions are complete; other cloud directories are not restored or deleted. New backups record only save and cheats. Recovery copies remain outside Documents.
+
+The packer emits matching entitlements, `DMICloudContainerIdentifier`, and `NSUbiquitousContainers` metadata. Associate **each game's App ID** with the shared container in Apple Developer, enable **iCloud Documents**, and regenerate its provisioning profile. `DM_ICLOUD_CONTAINER` at build time or `--icloud-container` in `scripts/sign_ipa.py` explicitly selects another container. Signing updates runtime metadata and entitlements together, and rejects a profile missing either explicit container grant or CloudDocuments. Merely including an entitlements file in an IPA grants no access. See [Apple's configuration instructions](https://developer.apple.com/documentation/xcode/configuring-icloud-services).
+
+`make -C dm/host/tests GAME=<title ID> cloud-save` tests synthetic snapshots, raw directory mirroring, conflicts and recovery. Real propagation still needs signed devices. Wait for upload completion before switching devices, then choose restore on the next device when you want that backup. Apple's current/downloaded status does not reveal another device's offline changes. The standalone Mac host now starts locally without a cloud gate; this migration UI is currently iOS-only.
+
 ### The regression harness
 
 One translation chain and one host serve every profile, but a contributor can test only the games they own, and CI has no game files and no Metal 4 (GitHub issue #272). `scripts/regress.py` compares two revisions on every game this Mac has a `--platform mac` build of, and writes a report that holds only numbers, hashes, shader keys, normalized `[RED]` texts and timings, so it can go into a pull request. It builds on the shader regression check the NSP script runs after each shader build ([packing step 6](#the-packing-script-in-detail)): that one compares one game's new build with its previous one when you rebuild it; the harness compares two revisions on every local game without touching their builds, and adds the MSL hashes, the pipeline interface and a run of the game.
@@ -288,7 +309,7 @@ open "<NSP parent folder>/NxNative.xcworkspace"
 
 Each game has its own generated project at `<NSP folder>/<title ID>_build/xcode/DmIOS.xcodeproj`. Its **Copy game resources** target phase (`dm/ios/tools/stage_resources.sh`) runs before code signing: it syncs the RomFS, the iOS shader libraries and the add-on content named in the project's `Gen/resources.env` to `DmIOS.app/romfs`, `DmIOS.app/msl/<b-chain, vk or gl>` and `DmIOS.app/aoc`. The rewritten game code is embedded by `Gen/embed.S` at link time. No keys are copied to the device. The project links `Sources`, `tools` and the host sources to the checkout it was prepared from (relinked on each preparation), so code edits apply to every prepared game. The prepared shaders do not follow a chain change: when the profile's `dmsh_chain.h` names another chain than the prepared shader folder (after a pull, or `dmsh_chain.py --header`), the phase stops and asks to prepare the game again.
 
-The project asks for the Increased Memory Limit capability (`Gen/DmIOS.entitlements`; without it iOS closes the bigger games, see the README). `DM_ENTITLEMENTS=<plist>` when preparing uses another entitlements file, and an empty `DM_ENTITLEMENTS=` none, for an account that cannot provision it.
+The project asks for Increased Memory Limit and iCloud Documents capabilities (`Gen/DmIOS.entitlements`). `DM_ENTITLEMENTS=<plist>` supplies base signing requirements; the packer adds its configured iCloud container and preserves unrelated grants. An empty `DM_ENTITLEMENTS=` omits Increased Memory Limit but still declares iCloud, which automatic save sync requires. Without Increased Memory Limit iOS closes larger games (see the README).
 
 The first Xcode build copies the complete game, so allow free space on the game's drive for another uncompressed copy; later builds sync changes. Derived data and build products go under `<NSP folder>/<title ID>_build/xcode-derived-data/`; keep that drive connected while building. The installed app holds its files and runs without the Mac.
 
