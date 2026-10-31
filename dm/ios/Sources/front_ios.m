@@ -375,8 +375,8 @@ void front_ios_focus_event(int ev) {
 
 // Cheat menu: summoned and dismissed by the hidden combo (hold L+R+ZL+ZR, hle_cheat.c menu_hotkey_tick), a panel over
 // the game listing the baked patches and file cheats with a switch each. Toggling acts at once (the engine tick applies
-// it within one tick); the rows' effective state refreshes after every switch (a keypress-gated patch reads off until
-// its buttons are held). The panel covers the middle of the screen; touches outside it keep going to the game.
+// it within one tick); the enabled states refresh after every switch, independently of held buttons.
+// The panel covers the middle of the screen; touches outside it keep going to the game.
 static UIScrollView *g_cheat_scroll;
 static NSMutableArray<UISwitch *> *g_cheat_switches;
 

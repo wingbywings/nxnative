@@ -96,7 +96,7 @@ del _dw, _dref
 
 # ---- Cheat patches (DM_CHEAT_FILE, module main only): Atmosphère-format code-write cheats baked in as toggleable patches ----
 # On iOS the sealed code pages cannot be written at run time, so a code-patch cheat cannot run from the cheat file. Instead the
-# build turns each enabled "store u32 at main+off" cheat into: the site instruction becomes a branch to a patch-area stub that
+# build turns each supported "store u32 at main+off" cheat into: the site instruction becomes a branch to a patch-area stub that
 # tests a flag byte and then executes either the original instruction (flag 0) or the cheat's instruction (flag 1). The flags
 # live in a writable page appended after the key page; hle_cheat.c finds it through the fixups header and maintains the bytes
 # from toggles.txt and (for keypress-gated cheats) the held buttons, so a baked patch is switched at run time exactly like a
@@ -158,12 +158,6 @@ if CHEAT_SRC:
     assert not FAR, 'cheat patches are not supported for images with the patch area before the base'
     with open(CHEAT_SRC, 'r', encoding='utf-8', errors='replace') as bake_file:
         bake_txt = bake_file.read()
-    site_owner, bake_off = {}, {}
-    tog_path = os.path.join(os.path.dirname(CHEAT_SRC), 'toggles.txt')
-    if os.path.exists(tog_path):
-        for ln in open(tog_path, 'r', encoding='utf-8', errors='replace'):
-            m = re.match(r'\s*\[(.*?)\]\s+(\S+)', ln)
-            if m and m.group(2).strip().lower() in ('0', 'false', 'off'): bake_off[m.group(1)] = True
     parsed, cur = [], None
     i, n = 0, len(bake_txt)
     while i < n:
@@ -191,18 +185,31 @@ if CHEAT_SRC:
     written = set()
     for ch in parsed: written |= cheat_written(ch['words'])
     for ch in parsed:
-        if ch['master'] or not ch['words'] or bake_off.get(ch['name']): continue   # the master block only restores baselines; the stub's off path is the original
+        if ch['master'] or not ch['words']: continue   # the master block only restores baselines; the stub's off path is the original
         mask, sites, cave, k, ok = 0, {}, {}, 0, True
+        has_else, key_open, key_done = False, False, False
+        prefix = {}
         ws = ch['words']
         while k < len(ws):
             w = ws[k]
             if w >> 28 == 0x8:                                   # keypress conditional wrapping the whole body
-                mask = w & 0x0FFFFFFF; k += 1; continue
-            if w >> 28 == 0x2:                                   # end of block: the baked flag makes the branch itself unnecessary. An else marker (2X, X = 1) ends the
-                if (w >> 24) & 0xF == 1: break                   # bakeable body: the else branch is the hold-cheat's restore of the original, the stub's off path
+                if key_open or key_done or cave: ok = False; break
+                mask = w & 0x0FFFFFFF
+                # An unconditional restore before the key block (TotK's mission timer) also has an off branch.
+                has_else = bool(sites) and all(o + 4 <= len(IMG) and struct.unpack_from('<I', IMG, o)[0] == v for o, v in sites.items())
+                if sites and not has_else: ok = False; break
+                prefix, key_open = dict(sites), True
                 k += 1; continue
+            if w >> 28 == 0x2:                                   # end of block: the baked flag makes the branch itself unnecessary. An else marker (2X, X = 1) ends the
+                if (w >> 24) & 0xF == 1:
+                    if not key_open: ok = False; break
+                    has_else = True; break                       # the enabled entry restores the original when its keys are released
+                if key_open: key_open, key_done = False, True
+                k += 1; continue
+            if key_done: ok = False; break                       # a store after the gate is not gated by the same keys
             if w >> 28 != 0x0: ok = False; break                 # anything but a store: leave it to the run-time engine
             width, mem, ofs = (w >> 24) & 0xF, (w >> 20) & 0xF, (w >> 16) & 0xF
+            if k + (4 if width == 8 else 3) > len(ws): ok = False; break
             rel = ((w & 0xFF) << 32) | ws[k + 1]; k += 2
             if width == 8: val = (ws[k] << 32) | ws[k + 1]; k += 2
             else: val = ws[k]; k += 1
@@ -217,39 +224,38 @@ if CHEAT_SRC:
         # must match this build's image: a table for another build would bake its sites over whatever stands there. TotK's
         # glider family restores 0x3D088889 (the 1/30 s time step) at main+0x2d01d70, a literal-pool float, not code.
         if mask and ok and k < len(ws) and ws[k] >> 28 == 0x2 and (ws[k] >> 24) & 0xF == 1:
-            r, bad = k + 1, False
+            r, bad, restored = k + 1, False, set()
             while r < len(ws):
                 w = ws[r]
-                if w >> 28 == 0x2: break                         # the block's end marker
+                if w >> 28 == 0x2:
+                    bad = w != 0x20000000 or r != len(ws) - 1
+                    break                                       # the block's end marker
                 if w >> 28 != 0x0: bad = True; break             # anything but a plain store: no original words to check
                 width, mem, ofs = (w >> 24) & 0xF, (w >> 20) & 0xF, (w >> 16) & 0xF
                 if mem != 0 or ofs in written or width not in (4, 8) or r + (4 if width == 8 else 3) > len(ws): bad = True; break
                 rel = ((w & 0xFF) << 32) | ws[r + 1]
                 val = ((ws[r + 2] << 32) | ws[r + 3]) if width == 8 else ws[r + 2]
                 r += 4 if width == 8 else 3
-                have = struct.unpack_from('<I', IMG, rel)[0] if rel + 4 <= len(IMG) else None
-                assert have == (val & 0xFFFFFFFF), \
-                    f'cheat file: "{ch["name"]}" restores {val & 0xFFFFFFFF:08x} at main+{rel:#x}, but this build holds ' \
-                    f'{have if have is not None else 0:08x} there: the table is for another build'
+                for at in range(rel, rel + width, 4):
+                    word = (val >> ((at - rel) * 8)) & 0xFFFFFFFF
+                    have = struct.unpack_from('<I', IMG, at)[0] if at + 4 <= len(IMG) else None
+                    assert have == word, \
+                        f'cheat file: "{ch["name"]}" restores {word:08x} at main+{at:#x}, but this build holds ' \
+                        f'{have if have is not None else 0:08x} there: the table is for another build'
+                    restored.add(at)
+            if bad or restored != sites.keys(): ok = False
+        if prefix and prefix.keys() != sites.keys(): ok = False
         if not ok or not sites:
             print(f'    cheat "{ch["name"]}": not bakeable (only u32/u64 stores at main+off), left to the run-time engine')
             continue
-        if not cave and all(off + 4 <= len(IMG) and struct.unpack_from('<I', IMG, off)[0] == v for off, v in sites.items()):
-            print(f'    cheat "{ch["name"]}": every site already holds the value it writes, skipped (a restore block; un-toggling the others restores the code)')
+        restore = not cave and all(off + 4 <= len(IMG) and struct.unpack_from('<I', IMG, off)[0] == v for off, v in sites.items())
+        # Runtime toggles never remove build-time variants. Every candidate retains all of its sites, including
+        # shared ones; the emitted dispatcher selects the last enabled file entry at each site.
+        ch.update(mask=mask, sites=sites, cave=cave, restore=restore, has_else=has_else)
+        if any(o in DATA_REFS or not 0 <= o < TEXT_END for o in sites):
+            print(f'    cheat "{ch["name"]}": contains a data word, not baked; the run-time engine handles the whole entry')
             continue
-        for off in list(sites):                                  # a later cheat writing the same site wins, as at run time
-            if off in site_owner: site_owner[off]['sites'].pop(off, None)
-        for off in sites: site_owner[off] = ch
-        ch.update(mask=mask, sites=sites, cave=cave)
         CHEAT_BAKE.append(ch)
-    CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c['sites']]
-    for ch in CHEAT_BAKE:                                        # a site the game reads as data is not an instruction: a baked branch
-        for off in [o for o in ch['sites'] if o in DATA_REFS]:   # there would be loaded as the constant by every reader
-            print(f'    cheat "{ch["name"]}": site {off:#x} is a data word the game reads (a literal-pool constant), not baked; the run-time engine toggles it')
-            del ch['sites'][off]
-    CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c['sites']]
-    assert len(CHEAT_BAKE) <= 0x40, \
-        f'cheat file: {len(CHEAT_BAKE)} bakeable cheats exceed the flags page\'s {0x40} records (hle_cheat.c BAKED_MAX)'
     if CHEAT_BAKE:
         # Past the frame-step state page (FS_STATE_OFF = KEY_PAGE_OFF + 0x4000 when the build has one, set later in the
         # frame-step section): the two pages must never share an address -- the host writes the target fps and render
@@ -1773,68 +1779,127 @@ if CHEAT_BAKE:
             branches.append(at + imm * 4)
             body.append(w); at += 4
         return None                                      # a hole or no verified return: refuse the whole hook
-    # Validate every site first (a word's position-independence never depends on where the stub lands), so the flag
-    # index a stub reads is the final table's row: a cheat that drops out entirely does not shift the others' rows.
-    # The original instruction runs in the stub too (the off path), so it must be position-independent as well.
+    def bake_instruction(w, source, dest):
+        """Relocate one instruction and its exits without scratch registers or changes to NZCV. Conditional
+        branches use a nearby inverted test plus long B exits; BL keeps the original game's link address."""
+        target = b_target(source, w, link=True)
+        if target is not None:
+            if not 0 <= target < TEXT_END or target & 3: return None
+            if w & 0x80000000:
+                return [ADRP(30, dest, source + 4), ADDI(30, 30, (source + 4) & 0xFFF), B(dest + 8, target)]
+            return [B(dest, target)]
+        if w & 0xFF000010 == 0x54000000:
+            imm, bits, mask, invert = (w >> 5) & 0x7FFFF, 19, 0xFFFFE0, 1
+        elif w & 0x7E000000 == 0x34000000:
+            if w & 0x1F == 18: return None  # Apple's x18 is not the guest's x18
+            imm, bits, mask, invert = (w >> 5) & 0x7FFFF, 19, 0xFFFFE0, 0x1000000
+        elif w & 0x7E000000 == 0x36000000:
+            if w & 0x1F == 18: return None
+            imm, bits, mask, invert = (w >> 5) & 0x3FFF, 14, 0x7FFE0, 0x1000000
+        else:
+            return [w, B(dest + 4, source + 4)] if bake_pi([w]) else None
+        if imm & (1 << (bits - 1)): imm -= 1 << bits
+        target = source + imm * 4
+        if not 0 <= target < TEXT_END: return None
+        if w & 0xFF000010 == 0x54000000 and w & 0xE == 0xE:  # AL and NV both always branch
+            return [B(dest, target)]
+        return [((w ^ invert) & ~mask) | (2 << 5), B(dest + 4, target), B(dest + 8, source + 4)]
+
+    # Coverage is all-or-nothing, for ordinary code patches as well as cave hooks. Once a name is baked the VM
+    # suppresses its entire file program, so dropping even one required site would silently change its meaning.
     for ch in CHEAT_BAKE:
-        ch['bodies'] = {}
-        bad_hook = False
-        for off in sorted(ch['sites']):
-            repl = ch['sites'][off]
+        ch['bodies'], ch['hooks'] = {}, set()
+        bad = False
+        for off, repl in sorted(ch['sites'].items()):
             orig = struct.unpack_from('<I', IMG, off)[0]
             why = None
-            if not orig: why = 'a code cave the cheat fills, not a patch site (its word is zero)'
-            elif not bake_pi([orig]): why = 'the original instruction is pc-relative'
+            if off in cut_at: why = 'collides with a registered cut'
+            elif not orig: why = 'zero word, not a code site'
+            elif bake_instruction(orig, off, here()) is None: why = 'unsupported original instruction'
             else:
-                body, tgt = [repl], b_target(off, repl, link=True)
-                if tgt is not None:         # a branch into the cheat's cave: inline the body, drop its return branch
+                tgt = b_target(off, repl, link=True)
+                if tgt is not None and tgt in ch['cave']:
                     body = bake_cave(off, repl, ch['cave'])
-                elif not bake_pi([repl]):
-                    body = None
-                if body is None: why = 'the cheat word is not position-independent'
+                    ch['hooks'].add(off)
+                elif ch['cave'] and tgt is not None:
+                    body = None  # a cave hook must not silently become a branch into uninitialized padding
+                else:
+                    body = [repl] if bake_instruction(repl, off, here()) is not None else None
+                if body is None: why = 'unsupported replacement or incomplete cave hook'
             if why:
-                print(f'    cheat "{ch["name"]}": site {off:#x} skipped ({why})')
-                if ch['cave'] and b_target(off, repl, link=True) is not None: bad_hook = True
+                print(f'    cheat "{ch["name"]}": site {off:#x} skipped ({why}); whole entry not baked')
+                bad = True
             else: ch['bodies'][off] = body
-        if bad_hook:
-            # The runtime skips a cheat by name once any site bakes. A partial hook cheat would therefore silently
-            # lose its essential calls (TotK durability used to bake just one arithmetic instruction).
-            ch['bodies'].clear()
-            print(f'    cheat "{ch["name"]}": incomplete cave hook, no sites baked')
+        if bad: ch['bodies'].clear()
     dropped = [c['name'] for c in CHEAT_BAKE if not c['bodies']]
     CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c['bodies']]
+    assert len(CHEAT_BAKE) <= 64, 'cheat file: more than 64 complete baked entries (DMCF capacity)'
+
+    site_variants = {}
     for idx, ch in enumerate(CHEAT_BAKE):
-        for off in sorted(ch['bodies']):
-            body = ch['bodies'][off]
-            assert off not in cut_at, f'cheat site {off:#x} collides with a registered cut'
-            orig = struct.unpack_from('<I', IMG, off)[0]
-            start = here()
-            emit(STUR(9, 31, -16))
-            emit(ADRP(9, here(), FLAGS_PAGE_OFF))
-            emit(LDR_FLAG(idx))
-            emit(CBNZ(here(), start + 7 * 4, 9))          # flag set → on path (word 7)
-            emit(LDUR(9, 31, -16)); emit(orig); emit(B(here(), off + 4))
-            emit(LDUR(9, 31, -16))
-            if ch['sites'][off] & 0xFC000000 == 0x94000000:
-                # Inlining a BL/RET pair must still leave the link register at the game's original return address.
-                emit(ADRP(30, here(), off + 4)); emit(ADDI(30, 30, (off + 4) & 0xFFF))
-            for w2 in body: emit(w2)
-            emit(B(here(), off + 4))
-            struct.pack_into('<I', IMG, off, B(off, start))
-            cuts.append((off, struct.pack('<I', orig).hex(), struct.pack('<I', B(off, start)).hex(),
+        if ch['restore']: continue  # restore rows are one-shot actions in the host, not competing persistent variants
+        for off in ch['bodies']: site_variants.setdefault(off, []).append(idx)
+    for off, variants in sorted(site_variants.items()):
+        orig = struct.unpack_from('<I', IMG, off)[0]
+        start, out, pending = here(), [STUR(9, 31, -16)], []
+        for idx in reversed(variants):
+            out += [ADRP(9, start + len(out) * 4, FLAGS_PAGE_OFF), LDR_FLAG(idx)]
+            pending.append((len(out), idx)); out.append(0)
+        default = start + len(out) * 4
+        out.append(LDUR(9, 31, -16))
+        relocated = bake_instruction(orig, off, start + len(out) * 4)
+        assert relocated is not None  # complete-entry validation above
+        out += relocated
+        for branch_slot, idx in pending:
+            ch = CHEAT_BAKE[idx]
+            out[branch_slot] = CBNZ(start + branch_slot * 4, start + len(out) * 4, 9)
+            if ch['has_else']:
+                # State 2 is an enabled hold-cheat's else branch. It overrides earlier entries with the original.
+                delta = (default - (start + len(out) * 4)) // 4
+                assert -(1 << 13) <= delta < (1 << 13)
+                out.append(0x37080009 | ((delta & 0x3FFF) << 5))  # tbnz w9,#1,default
+            out.append(LDUR(9, 31, -16))
+            if off in ch['hooks']:
+                if ch['sites'][off] & 0xFC000000 == 0x94000000:
+                    out += [ADRP(30, start + len(out) * 4, off + 4), ADDI(30, 30, (off + 4) & 0xFFF)]
+                out += ch['bodies'][off]
+                out.append(B(start + len(out) * 4, off + 4))
+            else:
+                relocated = bake_instruction(ch['sites'][off], off, start + len(out) * 4)
+                assert relocated is not None
+                out += relocated
+        for word in out: emit(word)
+        jump = B(off, start)
+        struct.pack_into('<I', IMG, off, jump)
+        for idx in variants:
+            ch = CHEAT_BAKE[idx]
+            cuts.append((off, struct.pack('<I', orig).hex(), struct.pack('<I', jump).hex(),
                          f'cheat patch "{ch["name"]}" (baked toggle flag {idx}, key mask {ch["mask"]:#x})', 'all'))
-            stat('cheat')
+        stat('cheat')
+
     hdr = bytearray(0x4000)
-    struct.pack_into('<II', hdr, 0, 0x46434D44, len(CHEAT_BAKE))   # 'DMCF', count
+    # DMCF v2 keeps the v1 names/flags layout. Record flags: bit 0 restore action, bit 1 hold-else;
+    # bits 8..15 alias index + 1. The 64-bit reset masks at +0x1600 identify complete entries to turn off.
+    struct.pack_into('<III', hdr, 0, 0x46434D44, len(CHEAT_BAKE), 2)
     for idx, c in enumerate(CHEAT_BAKE):
         r = 0x20 + idx * 0x48
-        struct.pack_into('<II', hdr, r, c['mask'], 0)
+        reset, alias = 0, 0
+        if c['restore']:
+            for j, other in enumerate(CHEAT_BAKE):
+                if not other['restore'] and c['sites'].keys() & other['sites'].keys(): reset |= 1 << j
+        else:
+            for j, other in enumerate(CHEAT_BAKE[:idx]):
+                if not other['restore'] and all(c[key] == other[key] for key in ('sites', 'cave', 'mask', 'has_else')):
+                    alias = j + 1; break
+        kind = int(c['restore']) | (int(c['has_else']) << 1) | (alias << 8)
+        struct.pack_into('<II', hdr, r, c['mask'], kind)
+        struct.pack_into('<Q', hdr, 0x1600 + idx * 8, reset)
         nb = c['name'].encode('utf-8')[:0x3F]
         hdr[r + 8:r + 8 + len(nb)] = nb
     IMG[FLAGS_PAGE_OFF:FLAGS_PAGE_OFF + 0x4000] = hdr
     assert not FS_STATE_OFF or FLAGS_PAGE_OFF >= FS_STATE_OFF + 0x4000, 'cheat flags page overlaps the frame step state page'
     if dropped: print(f'    cheat patches not baked: {", ".join(dropped)}')
-    print(f'    cheat patches: {len(CHEAT_BAKE)} baked (flags page at +{FLAGS_PAGE_OFF:#x}, toggled by the run-time cheat engine)')
+    print(f'    cheat patches: {len(CHEAT_BAKE)} baked entries, {len(site_variants)} code sites (DMCF v2 at +{FLAGS_PAGE_OFF:#x})')
 
 # ---- Final verification of the finished image ----
 # Every cut's new bytes must still be in place: a later pass may not silently overwrite one (TotK's №21 glider cut was eaten

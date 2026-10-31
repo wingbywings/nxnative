@@ -131,7 +131,7 @@ static int parse_cheats(const char *s, size_t len) {
 // parse_toggles drives baked-only rows too -- with everything off by default, toggles.txt is the only thing that
 // turns a row on, and a baked patch without a file entry has no other place to read its switch from
 enum { BAKED_MAX = 64 };
-static struct { char name[CHEAT_NAME]; uint32_t mask; uint8_t *flag; int on; int forced; } g_baked[BAKED_MAX];
+static struct { char name[CHEAT_NAME]; uint32_t mask; uint8_t *flag; int on; int forced; uint32_t kind; uint64_t reset; } g_baked[BAKED_MAX];
 static int g_nbaked = -1;                     // -1 = not discovered yet (the module has to be mapped first)
 
 // [name] 1/true/on or 0/false/off (case-insensitive values); names with no parsed cheat are ignored (dmnt allows)
@@ -694,6 +694,8 @@ static void baked_discover(void) {
         uint8_t *p = m->base + m->flags_page_off;
         if (memcmp(p, "DMCF", 4)) { LOG("[RED] cheat: flags page at main+%#llx carries no DMCF header", (unsigned long long)m->flags_page_off); return; }
         uint32_t n = *(uint32_t *)(p + 4);
+        uint32_t version = *(uint32_t *)(p + 8);
+        if (version > 2) { LOG("[RED] cheat: unsupported DMCF version %u", version); return; }
         if (n > BAKED_MAX) n = BAKED_MAX;
         for (uint32_t k = 0; k < n; k++) {
             const uint8_t *r = p + 0x20 + (size_t)k * 0x48;
@@ -702,6 +704,8 @@ static void baked_discover(void) {
             g_baked[g_nbaked].flag = p + 0x1400 + (size_t)k * 4;   // 4-aligned: the stub reads it with ldr w9
             g_baked[g_nbaked].on = -1;        // unknown; the first tick sets and logs it
             g_baked[g_nbaked].forced = 0;
+            g_baked[g_nbaked].kind = version == 2 ? *(const uint32_t *)(r + 4) : 0;
+            g_baked[g_nbaked].reset = version == 2 ? *(const uint64_t *)(p + 0x1600 + (size_t)k * 8) : 0;
             g_nbaked++;
         }
         LOG("cheat: %d baked patches on the flags page at main+%#llx (toggled like file cheats, through toggles.txt)",
@@ -710,22 +714,46 @@ static void baked_discover(void) {
     }
 }
 
-// One maintenance step: the file table's toggle state (default on, dmnt's default), then the keypress gate.
+static int baked_enabled(int i) {
+    for (int k = 1; k < g_nent; k++)
+        if (!strcmp(g_ent[k].def.name, g_baked[i].name)) return g_ent[k].enabled;
+    return g_baked[i].forced;
+}
+
+static void baked_set(int i, int on) {
+    g_baked[i].forced = on;
+    for (int k = 1; k < g_nent; k++)
+        if (!strcmp(g_ent[k].def.name, g_baked[i].name)) g_ent[k].enabled = on;
+}
+
+static void toggles_save_locked(void);
+
+// One maintenance step: consume restore actions, then update each toggle's keypress state.
 void cheat_baked_pump(void) {
     baked_discover();
     if (g_nbaked <= 0) return;
     uint64_t held = dm_input_held();
+    int restored = 0;
     for (int i = 0; i < g_nbaked; i++) {
-        int on = g_baked[i].forced;                        // its own bit when no file row carries the name
-        for (int k = 1; k < g_nent; k++)
-            if (!strcmp(g_ent[k].def.name, g_baked[i].name)) { on = g_ent[k].enabled; break; }
-        if (g_baked[i].mask && (held & g_baked[i].mask) != g_baked[i].mask) on = 0;
+        if (!(g_baked[i].kind & 1) || !baked_enabled(i)) continue;
+        if (g_baked[i].mask && (held & g_baked[i].mask) != g_baked[i].mask) continue;
+        for (int j = 0; j < g_nbaked; j++)
+            if (g_baked[i].reset & (UINT64_C(1) << j)) baked_set(j, 0);
+        baked_set(i, 0);  // one-shot restore: never keep a permanent override over a later user choice
+        restored = v_dirty = 1;
+        LOG("cheat: restore '%s' applied", g_baked[i].name);
+    }
+    for (int i = 0; i < g_nbaked; i++) {
+        int on = (g_baked[i].kind & 1) ? 0 : baked_enabled(i);
+        if (on && g_baked[i].mask && (held & g_baked[i].mask) != g_baked[i].mask)
+            on = (g_baked[i].kind & 2) ? 2 : 0;  // enabled else branch overrides earlier shared-site variants
         if (on != g_baked[i].on) {
             g_baked[i].on = on;
             *g_baked[i].flag = (uint8_t)on;
-            LOG("cheat: baked patch '%s' %s", g_baked[i].name, on ? "on" : "off");
+            LOG("cheat: baked patch '%s' %s", g_baked[i].name, on == 2 ? "else (original)" : on ? "on" : "off");
         }
     }
+    if (restored) toggles_save_locked();
 }
 
 int cheat_menu_count(void) {
@@ -768,7 +796,7 @@ static void toggles_save_locked(void) {       // caller holds g_mu
     else { unlink(temporary); LOG("[RED] cheat: cannot publish switches"); }
 }
 
-// One row: the name and the effective state (a keypress-gated patch reads off until its buttons are held)
+// One row: the name and the user's enabled state. Held keys gate execution, never the menu switch.
 void cheat_menu_get(int i, char *name, int cap, int *on) {
     baked_discover();
     pthread_mutex_lock(&g_mu);
@@ -777,10 +805,7 @@ void cheat_menu_get(int i, char *name, int cap, int *on) {
     int eff = 0;
     if (g_nbaked > 0 && i < g_nbaked) {
         src = g_baked[i].name;
-        eff = g_baked[i].forced;
-        for (int k = 1; k < g_nent; k++)
-            if (!strcmp(g_ent[k].def.name, src)) { eff = g_ent[k].enabled; break; }
-        if (g_baked[i].mask && (dm_input_held() & g_baked[i].mask) != g_baked[i].mask) eff = 0;
+        eff = baked_enabled(i);
     } else {
         n = g_nbaked > 0 ? g_nbaked : 0;
         for (int k = 1; k < g_nent; k++) {
@@ -788,7 +813,11 @@ void cheat_menu_get(int i, char *name, int cap, int *on) {
             if (n++ == i) { src = g_ent[k].def.name; eff = g_ent[k].enabled; break; }
         }
     }
-    if (src) snprintf(name, cap, "%s", src);
+    if (src && i < g_nbaked && (g_baked[i].kind & 1)) snprintf(name, cap, "%s [restore action]", src);
+    else if (src && i < g_nbaked && ((g_baked[i].kind >> 8) & 0xFF) > 0 &&
+             ((g_baked[i].kind >> 8) & 0xFF) <= (uint32_t)g_nbaked)
+        snprintf(name, cap, "%s [same code as %s]", src, g_baked[((g_baked[i].kind >> 8) & 0xFF) - 1].name);
+    else if (src) snprintf(name, cap, "%s", src);
     else { snprintf(name, cap, "?"); eff = 0; }
     if (on) *on = eff;
     pthread_mutex_unlock(&g_mu);
@@ -804,6 +833,7 @@ void cheat_menu_toggle(int i) {
             if (!strcmp(g_ent[k].def.name, g_baked[i].name)) { p = &g_ent[k].enabled; break; }   // a baked name with a file row: one switch drives both
         *p = !*p;
         v_dirty = 1;
+        if (g_baked[i].kind & 1) cheat_baked_pump();
         toggles_save_locked();
     } else {
         n = g_nbaked > 0 ? g_nbaked : 0;

@@ -5,9 +5,11 @@ stores whole ARM instructions as values, which read as load / arithmetic opcodes
 write addressed through offset register A)."""
 import ast
 import contextlib
+import ctypes
 import io
 from pathlib import Path
 import os
+import platform
 import re
 import struct
 import sys
@@ -39,6 +41,167 @@ bake_cave = cave_scope['bake_cave']
 def store(rel, val, ofs=0, width=4):
     """0TMR00AA AAAAAAAA YYYYYYYY (YYYYYYYY): a store at main+rel + the offset register, as the tables spell it."""
     return [width << 24 | ofs << 16 | (rel >> 32) & 0xFF, rel & 0xFFFFFFFF] + ([val >> 32, val & 0xFFFFFFFF] if width == 8 else [val & 0xFFFFFFFF])
+
+
+def bake_table(originals, rows, toggles='', data_refs=None):
+    """Run the parser and emitter against a small synthetic module, including shared sites and restore records."""
+    img, patch = bytearray(0x8000), []
+    for off, word in originals.items(): struct.pack_into('<I', img, off, word)
+    env = dict(cave_scope, os=os, re=re, cheat_written=cheat_written, IMG=img, TEXT_END=0x1000,
+               RO_OFF=0x2000, KEY_PAGE_OFF=0x4000, DATA_REFS=data_refs or {}, FAR=False, CHEAT_BAKE=[],
+               cuts=[], FLAGS_PAGE_OFF=0, FS_STATE_OFF=0, B=B, STUR=STUR, LDUR=LDUR, ADRP=ADRP, ADDI=ADDI,
+               here=lambda: 0x10000 + len(patch) * 4, emit=patch.append, stat=lambda _: None)
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / 'cheats.txt'
+        src.write_text(''.join(f'[{name}]\n' + ' '.join(f'{w:08X}' for w in words) + '\n' for name, words in rows))
+        (Path(d) / 'toggles.txt').write_text(toggles)
+        env['CHEAT_SRC'] = str(src)
+        blocks: list[ast.stmt] = [n for n in tree.body if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+                  and n.test.id in ('CHEAT_SRC', 'CHEAT_BAKE')]
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(ast.Module(body=blocks, type_ignores=[]), str(TOOLS / 'patch_nso.py'), 'exec'), env)
+    return env, patch
+
+
+class SharedSites(unittest.TestCase):
+    def test_variants_restore_alias_and_disabled_build_switches(self):
+        env, _ = bake_table({0x100: 0x52800020, 0x104: 0x52800040}, [
+            ('First', store(0x100, 0x52800060) + store(0x104, 0x52800080)),
+            ('Second', store(0x100, 0x528000A0)), ('Alias', store(0x100, 0x528000A0)),
+            ('Restore', store(0x100, 0x52800020))], '[First] off\n[Second] off\n')
+        self.assertEqual([c['name'] for c in env['CHEAT_BAKE']], ['First', 'Second', 'Alias', 'Restore'])
+        hdr = env['IMG'][env['FLAGS_PAGE_OFF']:]
+        self.assertEqual(struct.unpack_from('<III', hdr), (0x46434D44, 4, 2))
+        self.assertEqual(struct.unpack_from('<I', hdr, 0x20 + 2 * 0x48 + 4)[0], 2 << 8)
+        self.assertEqual(struct.unpack_from('<I', hdr, 0x20 + 3 * 0x48 + 4)[0], 1)
+        self.assertEqual(struct.unpack_from('<Q', hdr, 0x1600 + 3 * 8)[0], 7)
+        shared = [c for c in env['cuts'] if c[0] == 0x100]
+        self.assertEqual(len(shared), 3)
+        self.assertEqual(len({c[2] for c in shared}), 1)  # one dispatcher, all associations retained
+
+    def test_unsupported_site_drops_whole_entry_but_not_other_variants(self):
+        env, _ = bake_table({0x100: 0x52800020, 0x104: 0x90000000}, [
+            ('Partial', store(0x100, 0x52800060) + store(0x104, 0xD503201F)),
+            ('Complete', store(0x100, 0x52800080))])
+        self.assertEqual([c['name'] for c in env['CHEAT_BAKE']], ['Complete'])
+        self.assertEqual(struct.unpack_from('<I', env['IMG'], 0x104)[0], 0x90000000)
+
+    def test_mixed_data_and_code_cannot_suppress_runtime_half(self):
+        env, patch = bake_table({0x100: 0x52800020, 0x104: 0x52800040}, [
+            ('Mixed', store(0x100, 0x52800060) + store(0x104, 0x52800080))], data_refs={0x104: True})
+        self.assertEqual(env['CHEAT_BAKE'], [])
+        self.assertEqual(patch, [])
+
+    def test_key_else_and_unconditional_restore_prefix(self):
+        for words in ([0x80000002] + store(0x100, 0x52800060) + [0x21000000] + store(0x100, 0x52800020) + [0x20000000],
+                      store(0x100, 0x52800020) + [0x80000002] + store(0x100, 0x52800060) + [0x20000000]):
+            env, _ = bake_table({0x100: 0x52800020}, [('Hold', words)])
+            self.assertTrue(env['CHEAT_BAKE'][0]['has_else'])
+            self.assertEqual(struct.unpack_from('<II', env['IMG'], env['FLAGS_PAGE_OFF'] + 0x20), (2, 2))
+
+    def test_nonuniform_key_bodies_are_not_partially_baked(self):
+        for words in ([0x80000002, 0x80000001] + store(0x100, 0x52800060) + [0x20000000, 0x20000000],
+                      [0x80000002] + store(0x100, 0x52800060) + [0x20000000] + store(0x104, 0x52800080),
+                      [0x80000002] + store(0x100, 0x52800060) + [0x21000000] + store(0x104, 0x52800040) + [0x20000000],
+                      store(0x104, 0x52800080) + [0x80000002] + store(0x100, 0x52800060) + [0x20000000]):
+            env, patch = bake_table({0x100: 0x52800020, 0x104: 0x52800040}, [('Complex', words)])
+            self.assertEqual(env['CHEAT_BAKE'], [])
+            self.assertEqual(patch, [])
+
+    def test_u64_restore_checks_both_original_words(self):
+        words = [0x80000002] + store(0x100, 0x5280006052800080, width=8) + [0x21000000]
+        words += store(0x100, 0x5280000052800020, width=8) + [0x20000000]
+        with self.assertRaisesRegex(AssertionError, 'the table is for another build'):
+            bake_table({0x100: 0x52800020, 0x104: 0x52800040}, [('Wrong upper half', words)])
+
+    def test_branch_to_external_image_or_guest_x18_requires_other_rewriting(self):
+        for word in (B(0x100, 0x2000), 0x34000112, 0x36000112):
+            env, patch = bake_table({0x100: 0x52800020}, [('Unsupported branch', store(0x100, word))])
+            self.assertEqual(env['CHEAT_BAKE'], [])
+            self.assertEqual(patch, [])
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and platform.machine() == 'arm64', 'native ARM64 dispatcher execution on macOS')
+class NativeDispatch(unittest.TestCase):
+    def execute(self, originals, rows, states, arg=0, nzcv=0):
+        # A synthetic caller preserves its ABI frame. Branch destinations record x9, NZCV and the link register
+        # before returning to it; this catches flag/register clobbers as well as incorrect taken/fallthrough exits.
+        originals = dict(originals)
+        originals.update({0x80: 0xA9BF7BFD, 0x84: 0xD2824689, 0x88: B(0x88, 0x100) | 0x80000000,
+                          0x8C: 0xA8C17BFD, 0x90: 0xD65F03C0,
+                          0x180: 0xF9000029, 0x184: 0xD53B420A, 0x188: 0xF900042A,
+                          0x18C: 0xF900083E, 0x190: B(0x190, 0x8C)})
+        # Set NZCV from x2 just before the call, without affecting the seeded scratch register.
+        originals[0x88] = 0xD51B4202
+        originals[0x8C] = B(0x8C, 0x100) | 0x80000000
+        originals[0x90], originals[0x94], originals[0x190] = 0xA8C17BFD, 0xD65F03C0, B(0x190, 0x90)
+        env, patch = bake_table(originals, rows)
+        img = env['IMG'] + struct.pack('<' + 'I' * len(patch), *patch)
+        self.assertEqual(len(env['IMG']), 0x10000)
+        for i, state in enumerate(states): struct.pack_into('<I', img, env['FLAGS_PAGE_OFF'] + 0x1400 + 4 * i, state)
+        libc = ctypes.CDLL(None)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.sys_icache_invalidate.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        size = 0x20000
+        addr = libc.mmap(None, size, 7, 0x1002 | 0x800, -1, 0)  # MAP_ANON | MAP_PRIVATE | MAP_JIT
+        self.assertNotEqual(addr, ctypes.c_void_p(-1).value)
+        try:
+            libc.pthread_jit_write_protect_np(0)
+            ctypes.memmove(addr, bytes(img), len(img))
+            libc.sys_icache_invalidate(addr, size)
+            libc.pthread_jit_write_protect_np(1)
+            observed = (ctypes.c_uint64 * 3)()
+            call = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64)(addr + 0x80)
+            value = call(arg, observed, nzcv)
+            self.assertEqual(observed[0], 0x1234)
+            self.assertEqual(observed[1], nzcv)
+            return value, observed[2] - addr
+        finally:
+            libc.munmap(addr, size)
+
+    def test_shared_variants_and_released_else_priority(self):
+        originals = {0x100: 0x52800020, 0x104: B(0x104, 0x180)}
+        rows = [('First', store(0x100, 0x52800040)),
+                ('Hold', [0x80000002] + store(0x100, 0x52800060) + [0x21000000] + store(0x100, 0x52800020) + [0x20000000])]
+        for states, expected in (([0, 0], 1), ([1, 0], 2), ([0, 1], 3), ([1, 1], 3), ([1, 2], 1)):
+            with self.subTest(states=states):
+                self.assertEqual(self.execute(originals, rows, states, nzcv=0xA0000000), (expected, 0x90))
+
+    def test_three_hold_speeds_can_be_disabled_and_reselected(self):
+        originals = {0x100: 0x52800020, 0x104: B(0x104, 0x180)}
+        rows = [(f'Speed {speed}', [0x80000002] + store(0x100, 0x52800000 | speed << 5) +
+                 [0x21000000] + store(0x100, 0x52800020) + [0x20000000]) for speed in (2, 3, 10)]
+        # Enable 10x, release B, disable it, then select 2x and 3x separately; finally restore normal speed.
+        for states, expected in (([0, 0, 1], 10), ([0, 0, 2], 1), ([0, 0, 0], 1),
+                                 ([1, 0, 0], 2), ([2, 0, 0], 1), ([0, 0, 0], 1),
+                                 ([0, 1, 0], 3), ([0, 2, 0], 1), ([0, 0, 0], 1)):
+            with self.subTest(states=states):
+                self.assertEqual(self.execute(originals, rows, states), (expected, 0x90))
+
+    def test_conditional_originals_taken_and_fallthrough(self):
+        # Forward/backward offsets, zero/nonzero, bit tests, and condition flags, both 32 and 64 bit forms.
+        for source_word, arg, nzcv, taken in ((0x34000100, 0, 0, True), (0x34000100, 1, 0, False),
+                (0xB5000100, 1, 0, True), (0xB5000100, 0, 0, False),
+                (0x36000100, 0, 0, True), (0x37000100, 1, 0, True),
+                (0x5400010C, 0, 0, True), (0x5400010C, 0, 0x40000000, False),
+                (0x34FFFF00, 0, 0, True)):
+            # The last word encodes cbz w0,0xe0 (a negative offset).
+            target = 0xE0 if source_word == 0x34FFFF00 else 0x120
+            originals = {0x100: source_word, 0x104: 0x52800040, 0x108: B(0x108, 0x180),
+                         target: 0x52800060, target + 4: B(target + 4, 0x180)}
+            for enabled in (0, 1):
+                with self.subTest(word=hex(source_word), arg=arg, enabled=enabled):
+                    result = self.execute(originals, [('Nop', store(0x100, 0xD503201F))], [enabled], arg, nzcv)
+                    self.assertEqual(result, (3 if taken and not enabled else 2, 0x90))
+
+    def test_branch_replacement_and_original_call_link(self):
+        originals = {0x100: B(0x100, 0x120) | 0x80000000, 0x104: B(0x104, 0x180),
+                     0x120: 0x528000E0, 0x124: 0xD65F03C0, 0x140: 0x52800120, 0x144: B(0x144, 0x180)}
+        rows = [('Branch', store(0x100, B(0x100, 0x140)))]
+        self.assertEqual(self.execute(originals, rows, [0]), (7, 0x104))
+        self.assertEqual(self.execute(originals, rows, [1]), (9, 0x90))
 
 
 class CaveHooks(unittest.TestCase):

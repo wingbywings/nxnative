@@ -203,7 +203,22 @@ int main(void) {
     g_mod[0].flags_page_off = 0x20400;
     memset(fp, 0, 0x2000);
     memcpy(fp, "DMCF", 4);
-    *(uint32_t *)(fp + 4) = 2;
+    const int baked_rows =
+#ifdef TEST_DMCF_V2
+        4;
+    *(uint32_t *)(fp + 8) = 2;
+    *(uint32_t *)(fp + 0x20 + 0x48 + 4) = 2; // hold-else: key release is a priority-bearing original branch
+    *(uint32_t *)(fp + 0x20 + 2 * 0x48 + 4) = 1;
+    strcpy((char *)fp + 0x20 + 2 * 0x48 + 8, "Restore both");
+    *(uint64_t *)(fp + 0x1600 + 2 * 8) = 0xB; // both original entries and the alias
+    *(uint32_t *)(fp + 0x20 + 3 * 0x48 + 4) = 1 << 8;
+    strcpy((char *)fp + 0x20 + 3 * 0x48 + 8, "Baked alias");
+    const int released = 2;
+#else
+        2;
+    const int released = 0;
+#endif
+    *(uint32_t *)(fp + 4) = (uint32_t)baked_rows;
     *(uint32_t *)(fp + 0x20) = 0;            strcpy((char *)fp + 0x20 + 8, "Baked one");
     *(uint32_t *)(fp + 0x20 + 0x48) = 0x10;  strcpy((char *)fp + 0x20 + 0x48 + 8, "Baked key");   // key L3, no file row
     g_held = 0;
@@ -216,7 +231,7 @@ int main(void) {
     CHECK(cheat_reload(g_dir) == 1);
     cheat_baked_pump();
     CHECK(fp[0x1400] == 1);                          // file row turned on through toggles.txt
-    CHECK(fp[0x1404] == 0);                          // key mask 0x10 (L3) not held: gated off
+    CHECK(fp[0x1404] == released);                   // v2 keeps the enabled else branch's priority
     g_held = 0x10;
     cheat_baked_pump();
     CHECK(fp[0x1404] == 1);                          // held: on
@@ -229,39 +244,89 @@ int main(void) {
     cheat_execute();
     CHECK(rd32(0x18000) == 0);                       // the baked name is skipped in the VM: only a real stub (the rewrite) would write
 
+    // A released key must not make an enabled menu switch appear off. The front end refreshes immediately
+    // after each tap; reporting the execution flag here hid enabled speed variants and their priority.
+    {
+        char label[64]; int enabled;
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 1);
+        cheat_menu_toggle(1); cheat_baked_pump();
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 0);
+        CHECK(fp[0x1404] == 0 && toggles_has("[Baked key] off"));
+        g_held = 0x10; cheat_baked_pump(); CHECK(fp[0x1404] == 0); // disabled stays off even while held
+        cheat_menu_toggle(1); cheat_baked_pump();
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 1 && fp[0x1404] == 1);
+        g_held = 0; cheat_baked_pump();
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 1 && fp[0x1404] == released);
+        // Exercise the same behavior when a file row, rather than the baked-only forced bit, owns the toggle.
+        write_file("0123456789abcdef.txt", "[Baked one]\n04000000 00018000 00000001\n[Baked key]\n04000000 00018004 00000002\n");
+        CHECK(cheat_reload(g_dir) == 1); cheat_baked_pump();
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 1);
+        cheat_menu_toggle(1); cheat_baked_pump();
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 0 && fp[0x1404] == 0);
+        CHECK(toggles_has("[Baked key] off"));
+        CHECK(cheat_reload(g_dir) == 1);
+        g_held = 0x10; cheat_baked_pump(); CHECK(fp[0x1404] == 0);
+        cheat_menu_get(1, label, sizeof label, &enabled); CHECK(enabled == 0);
+        g_held = 0;
+    }
+
     // 11. The menu view: one row per baked patch plus one per unbaked file cheat; rows start off, toggling flips the
     //     shared state, and every flip is written back to toggles.txt so the next launch starts from it
     write_file("0123456789abcdef.txt", "[Baked one]\n04000000 0001A000 00000001\n[Vm one]\n04000000 0001B000 00000002\n");
     write_file("toggles.txt", "[Baked key] off\n");   // a baked-only bit remembers earlier toggles until a file says otherwise
     CHECK(cheat_reload(g_dir) == 1);
     int rows = cheat_menu_count();
-    CHECK(rows == 3);                                // 2 baked (Baked one, Baked key) + 1 file-only (Vm one)
+    CHECK(rows == baked_rows + 1);
     char mn[64]; int on = 0;
     cheat_menu_get(0, mn, sizeof mn, &on);
     CHECK(!strcmp(mn, "Baked one") && on == 0);      // off until toggled
-    cheat_menu_get(2, mn, sizeof mn, &on);
+    cheat_menu_get(baked_rows, mn, sizeof mn, &on);
     CHECK(!strcmp(mn, "Vm one") && on == 0);
     unlink_file("toggles.txt");                      // no file yet: the first menu flip creates it
     cheat_menu_toggle(0);                            // baked row backed by a file entry: both flip, and persist
     cheat_baked_pump();
     CHECK(fp[0x1400] == 1);
     CHECK(toggles_has("[Baked one] on"));
-    cheat_menu_toggle(2);                            // file-only row
+    cheat_menu_toggle(baked_rows);                   // file-only row
     cheat_execute();
     CHECK(rd32(0x1B000) == 2);                       // Vm one now runs
     CHECK(toggles_has("[Vm one] on") && toggles_has("[Baked key] off"));
     *(uint32_t *)(M + 0x1B000) = 7;                  // a switched-off cheat stops writing; what it wrote stays (dmnt semantics)
-    cheat_menu_toggle(2);
+    cheat_menu_toggle(baked_rows);
     cheat_execute();
     CHECK(rd32(0x1B000) == 7);
     CHECK(toggles_has("[Vm one] off"));              // the flip-back persisted too
-    cheat_menu_toggle(2);                            // on again; the file now says on
+    cheat_menu_toggle(baked_rows);                   // on again; the file now says on
     // and the next launch starts from exactly that file
     write_file("0123456789abcdef.txt", "[Baked one]\n04000000 0001A000 00000001\n[Vm one]\n04000000 0001B000 00000002\n");
     CHECK(cheat_reload(g_dir) == 1);
     *(uint32_t *)(M + 0x1B000) = 0;
     cheat_execute();
     CHECK(rd32(0x1A000) == 0 && rd32(0x1B000) == 2); // Baked one still skipped in the VM, Vm one carried over as on
+
+#ifdef TEST_DMCF_V2
+    cheat_menu_get(3, mn, sizeof mn, &on);
+    CHECK(strstr(mn, "same code as Baked one") != NULL);
+    cheat_menu_get(2, mn, sizeof mn, &on);
+    CHECK(strstr(mn, "restore action") != NULL);
+    cheat_menu_toggle(1);
+    cheat_menu_toggle(3);
+    cheat_baked_pump();
+    CHECK(fp[0x1400] == 1 && fp[0x1404] == 2 && fp[0x140C] == 1);
+    cheat_menu_toggle(2);                            // action without a file row: immediate, one-shot, persisted
+    CHECK(fp[0x1400] == 0 && fp[0x1404] == 0 && fp[0x140C] == 0);
+    cheat_menu_get(2, mn, sizeof mn, &on); CHECK(on == 0);
+    CHECK(toggles_has("[Baked one] off") && toggles_has("[Baked key] off") && toggles_has("[Baked alias] off"));
+    CHECK(toggles_has("[Restore both] off") && toggles_has("[Vm one] on"));
+    cheat_menu_toggle(0); cheat_baked_pump(); CHECK(fp[0x1400] == 1); // restore does not keep overriding new choices
+    write_file("0123456789abcdef.txt", "[Baked one]\n04000000 0001A000 00000001\n[Restore both]\n04000000 0001A000 00000000\n");
+    set_on("Baked one,Restore both");
+    CHECK(cheat_reload(g_dir) == 1);
+    cheat_baked_pump();
+    CHECK(fp[0x1400] == 0 && fp[0x1408] == 0 && cheat_enabled_count() == 0);
+    CHECK(toggles_has("[Baked one] off") && toggles_has("[Restore both] off"));
+    CHECK(cheat_reload(g_dir) == 1); cheat_baked_pump(); CHECK(fp[0x1400] == 0);
+#endif
 
     unlink_file("0123456789abcdef.txt");
     unlink_file("toggles.txt");

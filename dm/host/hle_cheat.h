@@ -23,7 +23,7 @@ void cheat_baked_pump(void);
 
 // The in-game menu (summoned by the hidden hotkey, see hle_cheat.c; the iOS front end shows the panel): a merged,
 // toggleable view of baked patches and file cheats. Callable from the front end's main thread; safe against the engine
-// tick. cheat_menu_get fills the row's name and its effective state (a keypress-gated patch reads off until held).
+// tick. cheat_menu_get fills the row's name and its enabled state, independent of held keys.
 int  cheat_menu_count(void);
 void cheat_menu_get(int i, char *name, int cap, int *on);
 void cheat_menu_toggle(int i);

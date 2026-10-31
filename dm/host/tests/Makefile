@@ -38,6 +38,7 @@ run: $(B)/t_cheat $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(
 	$(B)/t_preempt
 	$(B)/t_preempt --all-peers
 	TMPDIR="$(abspath $(B))" $(B)/t_cheat
+	TMPDIR="$(abspath $(B))" $(B)/t_cheat_v2
 	$(B)/t_pctl
 	$(B)/t_time
 	$(B)/t_shared_font
@@ -217,6 +218,9 @@ $(B):
 	mkdir -p $@
 $(B)/t_cheat: t_cheat.c ../hle_cheat.c ../hle_cheat.h ../dm.h | $(B)
 	clang -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_cheat.c ../hle_cheat.c
+$(B)/t_cheat_v2: t_cheat.c ../hle_cheat.c ../hle_cheat.h ../dm.h | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -DTEST_DMCF_V2 -I.. $(GINC) -o $@ t_cheat.c ../hle_cheat.c
+run: $(B)/t_cheat_v2
 .PHONY: run tsan
 $(B)/t_resolution: t_resolution.c ../hle_fpslock.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	clang -O1 -Wall -Werror -Wno-unused-function -fsanitize=undefined -I.. $(GINC) -o $@ t_resolution.c
