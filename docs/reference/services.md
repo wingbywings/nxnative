@@ -154,6 +154,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Found on:** the [synthetic cloud-save regression](../../dm/host/tests/t_cloud_save.m); real two-device validation remains open.
 - **Open:** offline play can intentionally use an older local save. Concurrent devices may conflict; no automatic winner is chosen. Legacy flat snapshots are preserved rather than silently migrated.
 
+### iCloud launcher callback escapes its Swift declaration
+
+- **Symptom:** confirming backup or restore terminates the app immediately with `closure argument passed as @noescape to Objective-C has escaped`; the cloud folder may never be created.
+- **Cause:** `Launcher.swift` declared the Objective-C block callback without `@escaping`, while `CloudSaveGate.m` retains it for background work and main-queue completion. Release builds enforce the nonescaping contract even though linking succeeds. An independent signing defect copied the provisioning profile's iCloud environment allowlist into the app signature instead of selecting one string.
+- **Fix:** declare the asynchronous callback `@escaping @convention(block)`. The signer selects a profile-authorized scalar environment (`Production` for Ad Hoc, `Development` for debug profiles), preserving explicit valid overrides and rejecting incompatible ones.
+- **Check:** `dm/ios/tests/test_launcher_cloud.py` compiles the production Swift declaration and Objective-C bridge with a fake transport, executes backup and unavailable-iCloud completion, and checks main-queue delivery. The original declaration traps in the optimized reproducer; the corrected one completes. `test_sign_icloud.py` checks environment selection and rejection.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md), signed IPA inspected on 2026-10-30. Device crash report and corrected two-device iCloud propagation remain unverified.
+
 ### Save data size queries
 
 - **Symptom:** SIGSEGV at address 0 in `nn::fs::GetSaveDataSizeMax`, about 13 minutes into a new game.

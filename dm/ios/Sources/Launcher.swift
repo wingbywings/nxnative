@@ -7,7 +7,7 @@ import UIKit
 import os
 
 @_silgen_name("dm_launcher_cloud_transfer")
-private func cloudTransfer(_ restoring: Int32, _ completion: @convention(block) (NSString) -> Void)
+private func cloudTransfer(_ restoring: Int32, _ completion: @escaping @convention(block) (NSString) -> Void)
 
 private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
 

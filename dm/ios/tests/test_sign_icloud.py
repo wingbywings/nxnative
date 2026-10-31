@@ -10,6 +10,20 @@ spec.loader.exec_module(sign)
 
 
 class CloudSigning(unittest.TestCase):
+    def test_profile_environment_allowlist_becomes_one_app_environment(self):
+        key = 'com.apple.developer.icloud-container-environment'
+        grants = {k: ['iCloud.com.oops.game'] for k in (
+            'com.apple.developer.icloud-container-identifiers', 'com.apple.developer.ubiquity-container-identifiers')}
+        grants.update({key: ['Production', 'Development'], 'com.apple.developer.icloud-services': '*', 'get-task-allow': False})
+        for debug, expected in ((False, 'Production'), (True, 'Development')):
+            grants['get-task-allow'] = debug
+            ent = sign.build_entitlements({'TeamIdentifier': ['TEST'], 'Entitlements': grants}, 'com.oops.botw', [], False)
+            sign.configure_icloud({'DMICloudContainerIdentifier': 'iCloud.com.oops.game'}, ent, {'Entitlements': grants}, 'com.oops.botw')
+            self.assertEqual(ent[key], expected)
+        grants[key] = ['Production']
+        with self.assertRaisesRegex(SystemExit, 'environment Development'):
+            sign.configure_icloud({'DMICloudContainerIdentifier': 'iCloud.com.oops.game'}, {key: 'Development'}, {'Entitlements': grants}, 'com.oops.botw')
+
     def test_final_bundle_updates_all_container_fields(self):
         container = 'iCloud.com.oops.game'
         keys = ('com.apple.developer.icloud-container-identifiers', 'com.apple.developer.ubiquity-container-identifiers')

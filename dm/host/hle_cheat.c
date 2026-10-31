@@ -5,8 +5,9 @@
 //   · memory access goes through a guard (access_kind below): the game runs in this process, so a bad address would kill
 //     the whole app, not just the game; a rejected operation is skipped and logged, where dmnt's debug handle just fails
 //   · writes into a module's sealed code area (dmnt's debug handle bypasses page permissions; we cannot on iOS): on the Mac
-//     the pages are anonymous and get unsealed, written, flushed and resealed; on iOS they are shared signed pages and the
-//     write is rejected (the rewriter, patch_nso.py, is the iOS way to patch code)
+//     the write lands through a second, writable mapping of the same pages, so the executable mapping is never unsealed
+//     (vm_write below); on iOS the pages are shared signed pages and the write is rejected (the rewriter, patch_nso.py, is
+//     the iOS way to patch code)
 //   · PauseProcess / ResumeProcess reuse the host's SetThreadActivity stop-the-world (the IL2CPP GC's pause machinery)
 // The engine runs on its own thread at 12 Hz (dmnt's rate), like dmnt independent of the frame rate, and reloads the cheat
 // file / toggles.txt when their mtime changes, so toggling a cheat from the Files app needs no in-game UI.
@@ -27,6 +28,8 @@
 #include <unistd.h>
 #if !TARGET_OS_IPHONE
 #include <libkern/OSCacheControl.h>
+#include <mach/mach_init.h>     // mach_task_self; mach.h would collide with this file's vm_read / vm_write
+#include <mach/mach_vm.h>
 #endif
 
 // Guest memory layout and input, implemented by hle_svc.c / hle_hid.c / hle_thread.c (a unit test supplies its own)
@@ -229,11 +232,21 @@ static int vm_write(uint64_t a, uint64_t v, int width) {
         if (!g_code_reject++) LOG("[RED] cheat: write into sealed code at %#llx rejected (iOS code pages are not writable)", (unsigned long long)a);
         return 0;
 #else
+        // The write goes through a second, writable mapping of the same pages (the watch's alias, probe.c): the live
+        // mapping never loses its execute permission. Unsealing the page instead (mprotect RW, write, mprotect RX)
+        // left a window with no execute permission on a page the game's threads run, and a master code stores its
+        // instructions every tick (12 Hz): Breath of the Wild's main thread branched into a page mid-write while
+        // actors load and died at the target function's entry, the fault address equal to the pc (SIGBUS).
         uint64_t pg = a & ~0x3FFFull, plen = ((a + width - pg) + 0x3FFFull) & ~0x3FFFull;
-        if (mprotect((void *)pg, plen, PROT_READ | PROT_WRITE)) { reject(a, "write (code mprotect)"); return 0; }
+        mach_vm_address_t al = 0; vm_prot_t cur, max;
+        if (mach_vm_remap(mach_task_self(), &al, plen, 0, VM_FLAGS_ANYWHERE, mach_task_self(), pg, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS ||
+            mprotect((void *)al, plen, PROT_READ | PROT_WRITE)) {
+            if (al) mach_vm_deallocate(mach_task_self(), al, plen);
+            reject(a, "write (code remap)"); return 0;
+        }
         dm_guest_write_prepare((void *)a, width);
-        memcpy((void *)a, &v, width);
-        mprotect((void *)pg, plen, PROT_READ | PROT_EXEC);
+        memcpy((void *)(al + (a - pg)), &v, width);
+        mach_vm_deallocate(mach_task_self(), al, plen);
         sys_icache_invalidate((void *)a, width);
         return 1;
 #endif

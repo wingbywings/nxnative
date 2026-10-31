@@ -160,6 +160,22 @@ def configure_icloud(info, entitlements, profile, bundle, container=None):
     services = grants.get('com.apple.developer.icloud-services', [])
     if services != '*' and 'CloudDocuments' not in services and '*' not in services:
         die('the profile does not authorize iCloud Documents (CloudDocuments)')
+    # A profile lists allowed environments; the executable must choose one.
+    # Copying the profile's array verbatim does not produce an app entitlement.
+    environment_key = 'com.apple.developer.icloud-container-environment'
+    allowed = grants.get(environment_key)
+    environment = entitlements.get(environment_key)
+    if allowed is not None:
+        choices = [allowed] if isinstance(allowed, str) else allowed
+        if not isinstance(choices, list) or not choices or any(x not in ('Production', 'Development') for x in choices):
+            die('the profile has invalid iCloud container environments')
+        if not isinstance(environment, str):
+            preferred = 'Development' if grants.get('get-task-allow') else 'Production'
+            environment = preferred if preferred in choices else choices[0]
+        if environment not in choices:
+            die(f'the profile does not authorize the iCloud environment {environment}')
+    elif environment is not None and environment not in ('Production', 'Development'):
+        die('the app iCloud environment must be Production or Development')
     old = info.get('DMICloudContainerIdentifier')
     details = dict(info.get('NSUbiquitousContainers', {}).get(old, {}))
     details.update(NSUbiquitousContainerIsDocumentScopePublic=True,
@@ -170,6 +186,8 @@ def configure_icloud(info, entitlements, profile, bundle, container=None):
     for key in keys:
         entitlements[key] = [container]
     entitlements['com.apple.developer.icloud-services'] = ['CloudDocuments']
+    if environment is not None:
+        entitlements[environment_key] = environment
     return container
 
 

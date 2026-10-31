@@ -257,6 +257,13 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Fix:** `GetInfo(UserExceptionContextAddress)` must return a real buffer.
 - **Found on:** the source names no game.
 
+### Cheat code writes through a second mapping, the page never unsealed
+
+- **Symptom:** on the Mac, `CRASH sig=10` with the fault address equal to the pc, at the first instruction of a valid function reached by a normal `blr` — during a load, a minute or two in, only when a cheat file runs whose master stores instruction words into `main`; the same crash at different functions each run.
+- **Cause:** a run-time file cheat that patches code (a master block of `04000000 <main offset> <instruction>` rows) stores every engine tick (12 Hz). Each store unsealed the 16 KB text page (`mprotect` read-write — no execute permission), wrote the word and resealed read-execute. In the window between the two `mprotect`s any guest thread branching into a function on that page took the protection fault at its entry: SIGBUS, address = pc. The page is fine in the module image, so the disassembly shows nothing wrong.
+- **Fix:** the write lands through a second, writable mapping of the same pages — `mach_vm_remap` copy=FALSE, `mprotect` the alias read-write, write, unmap (the write watch's alias, [probe.c](../../dm/host/probe.c)) — so the executable mapping never changes protection; the icache flush and the dirty-write notice stay (`vm_write` in `hle_cheat.c`). A failed remap skips the store and logs it like any rejected write.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, 2026-10-31): the Chinese 1.9.0 master writes 25 instruction words a tick, two of them on the page holding a name-compare thunk, and the main thread died at `blr` targets `main+0xcdfe7c` (twice, ~14 s in while actors load) and `main+0xcc6fd0` with the old binary; 150 s with the fix ran to frame 7,800 with no crash and the master still writing.
+
 ## Running out of memory
 
 ### A null-pool buffer from a game heap that ran out
