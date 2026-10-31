@@ -16,7 +16,7 @@ uint64_t now_ns(void) { return atomic_load(&test_now); }
 int dm_thermal_now(void) { atomic_fetch_add(&thermal_reads, 1); return atomic_load(&test_thermal); }
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
-module_t g_mod[MAX_MOD]; int g_nmod;
+module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 
 static int checks, failed;
@@ -29,7 +29,9 @@ static void target(float fps) {
     uint32_t bits; memcpy(&bits, &fps, sizeof bits);
     __atomic_store_n((uint32_t *)fps_state, bits, __ATOMIC_RELAXED);
 }
-static void movie(int on) { __atomic_store_n((uint32_t *)(fps_state + 4), on, __ATOMIC_RELAXED); }
+static _Atomic int test_movie;
+int dm_movie_playing(void) { return atomic_load(&test_movie); }   // hle_movie.c: a movie's pictures are being handed out
+static void movie(int on) { atomic_store(&test_movie, on); }
 
 static _Atomic int ready, start;
 static void *reader(void *unused) {

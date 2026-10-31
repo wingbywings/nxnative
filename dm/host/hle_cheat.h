@@ -31,3 +31,12 @@ void cheat_menu_toggle(int i);
 // Diagnostics: how many memory operations the guard has rejected so far, and how many cheats are enabled.
 int cheat_reject_count(void);
 int cheat_enabled_count(void);
+
+// The fork engine owns baked flags and toggles.txt by default. An explicit upstream
+// cheats directory selects the upstream VM and Mac panel; never run both writers.
+#include <stdlib.h>
+#include <string.h>
+static inline int cheat_legacy_selected(void) {
+    const char *e = getenv("DM_CHEATS");
+    return !e || !*e || !strcmp(e, "off") || !strcmp(e, "on") || !strcmp(e, "1");
+}

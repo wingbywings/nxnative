@@ -179,11 +179,32 @@ class Build(unittest.TestCase):
         self.assertEqual(len(self.calls), 4)
         self.assertFalse((self.out / 'rest_pairs.tsv').exists())
 
+    def test_macos_takes_this_macs_major_version(self):   # not the SDK's: Xcode 27.1's SDK is 27.0 on macOS 26.6, which cannot open a 27.0 archive (GitHub issue #673)
+        def run(cmd, **kw):
+            cmd = [str(c) for c in cmd]
+            if cmd == ['sw_vers', '-productVersion']: return subprocess.CompletedProcess(cmd, 0, '26.6.2\n', '')
+            return self.fake_run(cmd)
+        with mock.patch.object(po.subprocess, 'run', run), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--platform', 'macos', '--gpu', 'g16s']), 0)
+        self.assertEqual(self.calls[0][:8], ['xcrun', '-sdk', 'macosx', 'metal-tt', '-arch', 'applegpu_g16s', '-macos-version-min', '26.0'])
+
     def test_depth_override_and_bad_key(self):
         self.main('--depth', 'gl', '--script-only')
         self.assertIn('depth\tnear=-w\n', (self.out / 'prebuilt.tsv').read_text()); self.assertEqual(self.calls, [])
         (self.prof / 'game.tsv').write_text('title_id\t0100000000001000\nname\tTest\ndepth_mode\tnear0\n')
         with self.assertRaises(SystemExit): self.main('--script-only')
+
+    def test_profile_archives_match_observed_depth(self):
+        # Issue #758 and its seven-game follow-up: these builds' NVN calls select near=0 (evidence in each game note).
+        # Exercise the real profiles through the builder with synthetic pairs: an omitted key must not quietly build main0.
+        profiles = ('01008CF01BAAC000', '010089C01E9CA000', '010056B015FE8000', '01007BB017812000',
+                    '01003E601E324000', '010020400E1C2000', '0100429011144000', '010014C011146000')
+        for gid in profiles:
+            with self.subTest(game=gid):
+                self.main('--game', gid, '--pairs', str(self.prof / 'shader_pairs.tsv'), '--script-only')
+                self.assertIn('depth\tnear=0\n', (self.out / 'prebuilt.tsv').read_text())
+                script = json.loads(next(self.work.glob('*.mtl4-json')).read_text())
+                self.assertEqual(script['pipeline_descriptors']['render_pipeline_descriptors'][0]['vertex_function_descriptor'], 'fnd:v_bp.main0_z')
 
     def test_library_content_invalidates_archive(self):
         self.main()
@@ -207,6 +228,20 @@ class Build(unittest.TestCase):
         self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\n')
         self.assertEqual((self.out / 'prebuilt.tsv').read_text(), po.stamp(CHAIN, True, b'v\tc\n'))
         self.assertIn('bases\t0\n', (self.out / 'archive.tsv').read_text())
+
+    def test_no_pairs_builds_nothing(self):   # GitHub issue #338: a header-only shader_pairs.tsv is nothing to build, not an error
+        self.main()
+        (self.prof / 'shader_pairs.tsv').write_text('# pairs\n')
+        before = len(self.calls)
+        self.assertEqual(self.main(), 0)
+        self.assertEqual(len(self.calls), before)
+        self.assertEqual(list(self.out.glob('*.mtl4a')), [])   # the old archive goes: mac_pso() then packs the app without one
+        self.assertFalse((self.out / 'rest_pairs.tsv').exists())
+        self.assertIn('bases\t0\n', (self.out / 'archive.tsv').read_text())
+
+    def test_pairs_all_left_out_is_an_error(self):   # pairs whose libraries the host would not take: still a failure
+        (self.prof / 'shader_pairs.tsv').write_text('x\ty\n')
+        with self.assertRaises(SystemExit): self.main()
 
     def test_metal_tt_failure_leaves_no_archive(self):
         def fail(cmd, **kw):

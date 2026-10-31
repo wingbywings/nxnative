@@ -92,3 +92,11 @@ def frame_step(ctx):
     fs_put(0x166dc60, [B(0x166dc60, start)], 'KIDS frame task: the frame-rate object\'s steps × its fps × vsyncs per update / 60 (state page target fps; 0 = as the game sets them)')
 
 FRAME_STEP = {'c3cf52bf2b05d7310884971b50bcccb8': frame_step}
+
+# How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
+# purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
+BINDING = [
+    {'what': '60 fps frame step: the KIDS frame task and frame-rate block', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own frame code; only the host's frame-step state page is shared. Fire Emblem: Three Houses and Taiko Risshiden V DX run on KTGL too, with other frame code",
+     'blocked': 'frame-step stubs have no function-matched form yet'},
+]

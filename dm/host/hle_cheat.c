@@ -943,6 +943,7 @@ static void *cheat_thread(void *arg) {
 }
 
 void cheat_start(void) {
+    if (!cheat_legacy_selected()) return;
     const char *off = getenv("DM_CHEATS");
     if (off && !strcmp(off, "off")) return;
     if (!*dm_main_build()) { LOG("[RED] cheat: this build output carries no build ID, a cheat file cannot be matched"); return; }

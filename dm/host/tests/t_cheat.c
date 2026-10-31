@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 // ---- fake guest memory ----
-module_t g_mod[MAX_MOD];       // normally loader.c's; the test stands in for the loader
+static module_t mods[4]; module_t *g_mod = mods;       // normally loader.c's; the test stands in for the loader
 int g_nmod;
 static uint8_t *M;             // the fake main module: [0, 0x10000) code, [0x10000, 0x24000) data
 static uint8_t *H;             // the fake heap
@@ -63,6 +63,13 @@ static int toggles_has(const char *needle) {
 }
 
 int main(void) {
+    // Existing toggles/baked flags stay on the fork engine; an upstream directory
+    // must select only the upstream writer, and "off" must never become a path.
+    unsetenv("DM_CHEATS"); assert(cheat_legacy_selected());
+    setenv("DM_CHEATS", "off", 1); assert(cheat_legacy_selected());
+    setenv("DM_CHEATS", "on", 1); assert(cheat_legacy_selected());
+    setenv("DM_CHEATS", "/tmp/upstream-cheats", 1); assert(!cheat_legacy_selected());
+    unsetenv("DM_CHEATS");
     const char *tmp = getenv("TMPDIR");
     snprintf(g_dir, sizeof g_dir, "%s", (tmp && *tmp) ? tmp : "/tmp");
     size_t dl = strlen(g_dir); while (dl && g_dir[dl - 1] == '/') g_dir[--dl] = 0;

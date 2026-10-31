@@ -11,7 +11,7 @@ Update 1.3.1 (v327680) over the base game, SDK 18.3.5. The Wii game (codename Co
 | `modules main subsdk0 sdk` | `game.tsv` | `subsdk1`–`subsdk4` are replaced by the host's Vulkan layer |
 | 1 GB block: `mem_reserve 0x40000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | the game never calls `SetHeapSize`; its memory is `main`'s bss. See [Memory](#memory) |
 | `vk_capture.tsv` | profile | the keys of the SPIR-V modules Hagi generates at run time, which the NSP script captures; see [Shaders](#shaders) |
-| Node area cut 1 GB → 62 MB | `dm/tools/sdk_patches.py`, `sdk` build `6075151627016eef…` | needed by Galaxy 2's movie allocator on the same `sdk` build; the cut applies to every module of that build |
+| Node area cut 1 GB → 62 MB, and regions of 4 MB and more aligned to 2 MB as SDK 20 | `dm/tools/sdk_patches.py`, the SDK-wide rules (`MATCH_CUTS`) on `sdk` build `6075151627016eef…` (its row, the node area cut alone, was removed on 2026-10-30 after a run on Monster Train 2, the same build) | needed by Galaxy 2's movie allocator on the same `sdk` build; the cut applies to every module of that build |
 
 ## Memory
 
@@ -35,7 +35,7 @@ Update 1.3.1 (v327680) over the base game, SDK 18.3.5. The Wii game (codename Co
 - **Linear images:** staging images (`VK_IMAGE_TILING_LINEAR`, filled by the CPU and copied with `vkCmdCopyImage`) and one sampled 4x4 image alias their memory as on the Switch: the texture is made over the bound `MTLBuffer` with Metal's linear row alignment, which `vkGetImageSubresourceLayout` reports.
 - **Queries:** two timestamp pools and a 3,072-entry occlusion pool. Timestamps are their submit's completion time; occlusion queries count into a per-submit visibility buffer, copied to the pool when the submit completes.
 - Also added for Galaxy: pipeline caches, `vkCmdDraw`, image copies and read-backs.
-- **Not translated:** two geometry shaders (GX points and lines expanded to quads); those draws come out as one-pixel points and lines. GX's sampler LOD bias has no Metal sampler equivalent (red line).
+- **Not translated:** two geometry shaders (GX points and lines expanded to quads); those draws come out as one-pixel points and lines. GX's sampler LOD bias goes to Metal's sampler bias ([Sampler LOD bias](../../../docs/reference/rendering.md#sampler-lod-bias), resolved).
 
 ## Shaders
 
@@ -50,7 +50,10 @@ Update 1.3.1 (v327680) over the base game, SDK 18.3.5. The Wii game (codename Co
 
 ## Input
 
-- Docked, Galaxy's pointer is the Joy-Con gyro, which the host now feeds with real data ([Six-axis sensors](../../../docs/reference/services.md#six-axis-sensors)); this game was brought up on the touch screen, so `op_mode handheld` starts it in handheld mode (720p).
+- Docked, Galaxy's pointer uses the controller gyro; handheld, it is the touch screen. `op_mode handheld` starts it in handheld mode (720p). `DM_OPMODE=1` selects docked mode for gyro input.
+- **Reported working, original PR #296:** JustWoody tested 1.3.1's docked pointer with a genuine Pro Controller over Bluetooth on an M3 Pro, macOS 27, using passive HID reports; GameController's motion was all zero. The reader now feeds the shared motion core ([Pro Controller fallback](../../../docs/reference/services.md#switch-pro-controller-advertises-motion-but-sends-zeroes)); that rework has automated tests only, with live sensitivity, axes, sample order and reconnect testing still open. The profile keeps its handheld default.
+
+See also the fork's [six-axis sensor history](../../../docs/reference/services.md#six-axis-sensors).
 - On the iPhone, touches no gamepad control takes go to the game's touch screen: in the 3D layout, those outside the right third of the screen, which is the right stick; all of them while a controller is connected. On the Mac the mouse is a finger, and `DM_KEYS` taps with `T<x>x<y>` (normalized picture coordinates).
 
 ## Services
@@ -76,10 +79,13 @@ General host changes first needed here; each applies to every game:
 - **Sleeps under 20 µs take the yield back-off** (`sleep_precise`, `hle_thread.c`): [Sleeps under 20 µs take the yield path](../../../docs/reference/threads.md#sleeps-under-20-µs-take-the-yield-path).
 - **SDK 18's `InitializeTouchScreen(int, int)`** hooked: [SDK calls that open a system service through sm](../../../docs/reference/services.md#sdk-calls-that-open-a-system-service-through-sm).
 - **`op_mode`** (the operation mode at start, `DM_OPMODE`): [dm/games/README.md, Keys](../README.md#keys).
+- **Sampler LOD bias** given to Metal (NVN and Vulkan): [Sampler LOD bias](../../../docs/reference/rendering.md#sampler-lod-bias).
+- **Pro Controller motion absent from GameController on the Mac:** [Switch Pro Controller advertises motion but sends zeroes](../../../docs/reference/services.md#switch-pro-controller-advertises-motion-but-sends-zeroes).
+- **The phone's gyro turned a quarter turn on iPhone Duo's inner display** (GitHub issue #569; iOS 27's `deviceMotionBody`, device test open): [The phone's motion in the picture's frame](../../../docs/reference/services.md#the-phones-motion-in-the-pictures-frame).
 
 ## Open
 
-- GX points and lines (the geometry shaders) and sampler LOD bias are not done. The player README lists it as a known issue: effects drawn as points or lines come out one pixel wide.
+- GX points and lines (the geometry shaders) are not done. The player README lists it as a known issue: effects drawn as points or lines come out one pixel wide.
 - The capture timing differs between sources: the game notes say the modules are created in about 15 s on the Mac (the capture "under a minute"); [development.md, The packing script in detail](../../../docs/development.md#the-packing-script-in-detail) says 3,089 keys about 7 s after launch.
 - The `min` / `max` / `clamp` NaN fix (`precise::`, GitHub issue 72) was found on Galaxy 2's GX lighting; its notes have the detail ([0100FD8022DAA000](../0100FD8022DAA000/README.md)). Not stated whether this game showed it.
 - `game.tsv` says values marked "Mario's" are not measured for this game; none of its rows is marked so.

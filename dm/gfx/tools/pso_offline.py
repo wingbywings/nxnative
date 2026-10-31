@@ -22,7 +22,9 @@
 #   --game: the profile (DM_GAMES_DIR as for game.py) whose shader_pairs.tsv and pso_pairs.tsv are the pairs, and whose depth_mode key the depth mode, unless --pairs / --depth say;
 #   --gpu: architectures, with or without the applegpu_ prefix (default g18p); --depth: the game's NVN depth mode (gl = near -w, NVN's default; zero = near 0, which the game sets
 #   with nvnDeviceSetDepthMode: the host knows it only at run time, so the profile says it; a wrong one costs the device its own prebuild, as without the archive);
-#   --os-min: the archives' minimum OS (default: the SDK's major version, e.g. 27.0; a device on an older system cannot open them and builds the bases itself)
+#   --os-min: the archives' system (default: for iOS the SDK's major version, e.g. 27.0; for macOS the major version this Mac runs, since the Mac app is built for the Mac that builds it).
+#   A device opens only an archive of its own major version (macOS 27.2 refused archives made for 26.0 and 26.6 and opened those for 27.0 and 27.2), and builds the bases itself
+#   otherwise: the SDK's version on a Mac whose system is older than its Xcode's SDK (macOS 26.6 with Xcode 27.1) left that Mac without them (GitHub issue #673)
 import argparse, hashlib, json, os, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
@@ -153,7 +155,8 @@ def tool_version(platform):
 
 
 def os_min_default(platform):
-    v = subprocess.run(['xcrun', '-sdk', sdk(platform), '--show-sdk-version'], capture_output=True, text=True, check=True).stdout.strip()
+    cmd = ['sw_vers', '-productVersion'] if platform == 'macos' else ['xcrun', '-sdk', sdk(platform), '--show-sdk-version']
+    v = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
     return v.split('.')[0] + '.0'
 
 
@@ -167,7 +170,7 @@ def main(argv=None):
     ap.add_argument('--gpu', default='g18p', help='GPU architectures, comma-separated (default g18p)')
     ap.add_argument('--depth', choices=('gl', 'zero'), help='the game\'s NVN depth mode (default: the profile\'s depth_mode, else gl: near = -w)')
     ap.add_argument('--platform', choices=('ios', 'macos'), default='ios')
-    ap.add_argument('--os-min', help='minimum OS of the archives (default: the SDK\'s major version)')
+    ap.add_argument('--os-min', help='minimum OS of the archives (default: iOS, the SDK\'s major version; macOS, this Mac\'s)')
     ap.add_argument('--script-only', action='store_true', help='write the script and the stamp, run no metal-tt')
     a = ap.parse_args(argv)
     if a.game:
@@ -186,17 +189,19 @@ def main(argv=None):
     if not text: sys.exit(f'[RED] pso_offline: no pair list ({", ".join(a.pairs)})')
     zero = a.depth == 'zero'
     t0 = time.time()
-    bases, rest, left = plan(lib_dir, chain, read_pairs(text), zero)
+    pairs = read_pairs(text)
+    bases, rest, left = plan(lib_dir, chain, pairs, zero)
     work.mkdir(parents=True, exist_ok=True); out.mkdir(parents=True, exist_ok=True)
     js = work / 'bases.mtl4-json'   # metal-tt takes the format from the extension: .mtl4-json is Metal 4's (.mtlp-json is the Metal 3 format)
     body = json.dumps(script(lib_dir, bases), indent=1).encode()
     if not js.is_file() or js.read_bytes() != body: js.write_bytes(body)
     st = stamp(chain, zero, text)
-    print(f'pso_offline: {len(read_pairs(text))} pairs: {len(bases)} bases, {len(rest)} left to the device (function constants), left out as the host leaves them: '
+    print(f'pso_offline: {len(pairs)} pairs: {len(bases)} bases, {len(rest)} left to the device (function constants), left out as the host leaves them: '
           + ', '.join(f'{k} {v}' for k, v in left.items()) + f' ({time.time() - t0:.1f} s)')
     if a.script_only: (out / 'prebuilt.tsv').write_text(st); return 0
-    if not bases and not rest: sys.exit('[RED] pso_offline: no base to build')
-    if not bases: archs = []   # every eligible pair needs device specialization; clear old archives and still write the remainder list
+    if pairs and not bases and not rest: sys.exit('[RED] pso_offline: no base to build')   # pairs, but the host would leave out every one: wrong or missing libraries
+    if not pairs: print('pso_offline: no pairs (only a header): nothing to build, no archive')   # a profile whose split found no pair (GitHub issue #338)
+    if not bases: archs = []   # no pair, or every eligible pair needs device specialization; clear old archives and still write the stamp and the remainder list
     osmin = a.os_min or os_min_default(a.platform); tv = tool_version(a.platform) if bases else 'not used (function constants only)'
     inputs = (lib_dir / 'inputs.tsv').read_text() if (lib_dir / 'inputs.tsv').is_file() else ''
     libraries = library_digest(lib_dir, bases)
