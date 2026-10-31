@@ -156,7 +156,8 @@ CHEAT_SRC = os.environ.get('DM_CHEAT_FILE') if NAME == 'main' else None
 CHEAT_BAKE, FLAGS_PAGE_OFF = [], 0
 if CHEAT_SRC:
     assert not FAR, 'cheat patches are not supported for images with the patch area before the base'
-    bake_txt = open(CHEAT_SRC, 'r', encoding='utf-8', errors='replace').read()
+    with open(CHEAT_SRC, 'r', encoding='utf-8', errors='replace') as bake_file:
+        bake_txt = bake_file.read()
     site_owner, bake_off = {}, {}
     tog_path = os.path.join(os.path.dirname(CHEAT_SRC), 'toggles.txt')
     if os.path.exists(tog_path):
@@ -206,9 +207,12 @@ if CHEAT_SRC:
             if width == 8: val = (ws[k] << 32) | ws[k + 1]; k += 2
             else: val = ws[k]; k += 1
             if width not in (4, 8) or mem != 0 or ofs in written: ok = False; break
-            dst = sites if rel < len(IMG) else cave              # code past the image is the cheat's own cave
-            if width == 8: dst[rel] = val & 0xFFFFFFFF; dst[rel + 4] = val >> 32   # a u64 store is little-endian: its low word lands at rel (two instruction slots, one flag)
-            else: dst[rel] = val
+            for at in range(rel, rel + width, 4):
+                # A cave can occupy the zero padding between text and rodata, inside the image (TotK), as well as
+                # space past it. Keep its words out of the patch sites: only a validated hook may execute them.
+                padding = TEXT_END <= at and at + 4 <= RO_OFF and IMG[at:at + 4] == bytes(4) and at not in DATA_REFS
+                dst = cave if at >= len(IMG) or padding else sites
+                dst[at] = (val >> ((at - rel) * 8)) & 0xFFFFFFFF
         # A hold-gated cheat's else branch writes the ORIGINAL words back (that is how it untoggles on the Switch). Every one
         # must match this build's image: a table for another build would bake its sites over whatever stands there. TotK's
         # glider family restores 0x3D088889 (the 1/30 s time step) at main+0x2d01d70, a literal-pool float, not code.
@@ -1713,8 +1717,8 @@ os.makedirs(outdir, exist_ok=True)
 # ---- Cheat patch stubs: the site word becomes B → stub; the stub tests the cheat's flag byte, then runs the original
 # instruction (flag 0) or the cheat's instruction sequence (flag 1). x9 is the only clobber and is saved; NZCV is untouched
 # (STUR/ADRP/LDRB/CBZ do not write flags). A site whose cheat word is itself a B into the cheat's code cave (writers of
-# trampoline-style cheats park their code past the image, where it lands inside the next module at run time) gets the cave
-# body inlined: position-independent words only, and the cave's final branch back is checked and replaced by the stub's own.
+# trampoline-style cheats use zero text padding or space past the image) gets the cave body inlined. Internal branches
+# retain their relative offsets; a final B back or RET from a BL hook becomes the stub's own return to the game.
 if CHEAT_BAKE:
     LDRB = lambda t, nn, imm12: 0x39400000 | (imm12 << 10) | (nn << 5) | t
     def LDR_FLAG(idx):                      # ldr w9, [x9, #0x1400+idx*4]: flag bytes sit past the records (LDRB reaches only 4095)
@@ -1722,8 +1726,8 @@ if CHEAT_BAKE:
     def CBNZ(frm, to, r):
         off = to - frm; assert off % 4 == 0 and -(1 << 20) <= off < (1 << 20)
         return 0x35000000 | (((off >> 2) & 0x7FFFF) << 5) | r
-    def b_target(at, w):                    # target of B at address at (None if not a B)
-        if w & 0xFC000000 != 0x14000000: return None
+    def b_target(at, w, link=False):        # target of B (or BL when requested)
+        if w & (0x7C000000 if link else 0xFC000000) != 0x14000000: return None
         imm = w & 0x3FFFFFF
         if imm & (1 << 25): imm -= 1 << 26   # signed 26-bit displacement
         return at + imm * 4
@@ -1738,11 +1742,43 @@ if CHEAT_BAKE:
             except AssertionError:
                 pass   # not an instruction (a constant the cheat stores): position-independent by construction
         return True
+
+    def bake_cave(off, repl, cave):
+        """Copy a closed cave: B returns to the hook's next word, BL ends in RET. No escaping internal branches or
+        instructions needing the host rewriter are accepted. The terminal word is replaced by the stub's return B,
+        at the same relative position, so branches to that terminal word remain valid too."""
+        start = b_target(off, repl, link=True)
+        if start is None: return None
+        call = bool(repl & 0x80000000)
+        body, branches, at = [], [], start
+        while at in cave:
+            w = cave[at]
+            if (call and w == 0xD65F03C0) or (not call and b_target(at, w) == off + 4):
+                return body if all(start <= t <= at for t in branches) else None
+            try: ins = dis(w, at)
+            except AssertionError: return None
+            rd, wr = regset(ins)
+            if (rd | wr) & {'x18', 'w18', 'sp', 'wsp', 'lr', 'x30', 'w30'}: return None
+            if ins.mnemonic in ('mrs', 'msr', 'svc', 'hvc', 'smc', 'brk', 'hlt', 'udf', 'ret', 'br', 'blr'): return None
+            if w & 0xFF000010 == 0x54000000 or w & 0x7E000000 == 0x34000000:  # b.cond / cbz / cbnz
+                imm, bits = (w >> 5) & 0x7FFFF, 19
+            elif w & 0x7E000000 == 0x36000000:             # tbz / tbnz
+                imm, bits = (w >> 5) & 0x3FFF, 14
+            elif b_target(at, w) is not None:             # internal unconditional B
+                imm, bits = w & 0x3FFFFFF, 26
+            else:
+                if not bake_pi([w]): return None
+                body.append(w); at += 4; continue
+            if imm & (1 << (bits - 1)): imm -= 1 << bits
+            branches.append(at + imm * 4)
+            body.append(w); at += 4
+        return None                                      # a hole or no verified return: refuse the whole hook
     # Validate every site first (a word's position-independence never depends on where the stub lands), so the flag
     # index a stub reads is the final table's row: a cheat that drops out entirely does not shift the others' rows.
     # The original instruction runs in the stub too (the off path), so it must be position-independent as well.
     for ch in CHEAT_BAKE:
         ch['bodies'] = {}
+        bad_hook = False
         for off in sorted(ch['sites']):
             repl = ch['sites'][off]
             orig = struct.unpack_from('<I', IMG, off)[0]
@@ -1750,20 +1786,21 @@ if CHEAT_BAKE:
             if not orig: why = 'a code cave the cheat fills, not a patch site (its word is zero)'
             elif not bake_pi([orig]): why = 'the original instruction is pc-relative'
             else:
-                body, tgt = [repl], b_target(off, repl)
+                body, tgt = [repl], b_target(off, repl, link=True)
                 if tgt is not None:         # a branch into the cheat's cave: inline the body, drop its return branch
-                    body = []
-                    off2 = tgt
-                    while off2 in ch['cave']: body.append(ch['cave'][off2]); off2 += 4
-                    if not body or b_target(off2 - 4, body[-1]) != off + 4: body = None
-                    else:
-                        body = body[:-1]    # the cave's branch back to off+4: the stub emits its own
-                        if not bake_pi(body): body = None
+                    body = bake_cave(off, repl, ch['cave'])
                 elif not bake_pi([repl]):
                     body = None
                 if body is None: why = 'the cheat word is not position-independent'
-            if why: print(f'    cheat "{ch["name"]}": site {off:#x} skipped ({why})')
+            if why:
+                print(f'    cheat "{ch["name"]}": site {off:#x} skipped ({why})')
+                if ch['cave'] and b_target(off, repl, link=True) is not None: bad_hook = True
             else: ch['bodies'][off] = body
+        if bad_hook:
+            # The runtime skips a cheat by name once any site bakes. A partial hook cheat would therefore silently
+            # lose its essential calls (TotK durability used to bake just one arithmetic instruction).
+            ch['bodies'].clear()
+            print(f'    cheat "{ch["name"]}": incomplete cave hook, no sites baked')
     dropped = [c['name'] for c in CHEAT_BAKE if not c['bodies']]
     CHEAT_BAKE[:] = [c for c in CHEAT_BAKE if c['bodies']]
     for idx, ch in enumerate(CHEAT_BAKE):
@@ -1778,6 +1815,9 @@ if CHEAT_BAKE:
             emit(CBNZ(here(), start + 7 * 4, 9))          # flag set → on path (word 7)
             emit(LDUR(9, 31, -16)); emit(orig); emit(B(here(), off + 4))
             emit(LDUR(9, 31, -16))
+            if ch['sites'][off] & 0xFC000000 == 0x94000000:
+                # Inlining a BL/RET pair must still leave the link register at the game's original return address.
+                emit(ADRP(30, here(), off + 4)); emit(ADDI(30, 30, (off + 4) & 0xFFF))
             for w2 in body: emit(w2)
             emit(B(here(), off + 4))
             struct.pack_into('<I', IMG, off, B(off, start))
