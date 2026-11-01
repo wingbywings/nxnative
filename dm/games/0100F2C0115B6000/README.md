@@ -82,6 +82,8 @@ Game-specific findings. The general host changes they led to are listed under [F
 
 - **Repeated prepare after a database-capacity error:** [bounded pipeline archive writes and completion receipts](../../../docs/reference/shaders.md#pipeline-archive-database-capacity-repeats-the-prepare-step).
 
+- **Gyro aiming crept to the right on a still controller (2026-11-01):** [The view creeps while the controller rests](../../../docs/reference/services.md#the-view-creeps-while-the-controller-rests). The raw gyro's bias was reported and integrated with nothing re-zeroing it; the Pro Controller's HID samples carry the largest bias of the sources. Covered by `t_motion` and `t_hid`; a Mac run with the controller held still is the remaining check (`DM_MOTION_LOG=1` shows the mapped sample, `DM_MOTION_ZERO=0` shows the raw bias).
+
 General host changes first needed here; each applies to every game:
 
 - **Data words are not bakeable sites, and no pass may change them** (a data-reference map, a wrong-build table abort and a final-image verification): [Data words are not bakeable sites, and no pass may change them](../../../docs/reference/rewriter.md#data-words-are-not-bakeable-sites-and-no-pass-may-change-them). Found as: forward+jump only jumped straight up and a grabbed Ultrahand object would not move, cured by toggling any glider-speed cheat either way; the site `main+0x2d01d70` is the game's 1/30 s pool constant, not an instruction.

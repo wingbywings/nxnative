@@ -89,6 +89,32 @@ int main(void) {
     float d01 = s.R[0][0] * s.R[0][1] + s.R[1][0] * s.R[1][1] + s.R[2][0] * s.R[2][1], n0 = s.R[0][0] * s.R[0][0] + s.R[1][0] * s.R[1][0] + s.R[2][0] * s.R[2][0];
     CHECK(near(d01, 0, 1e-4f) && near(n0, 1, 1e-4f), "orientation stays orthonormal");
 
+    // zero drift (gyro_zero): a controller at rest whose gyro carries a yaw bias holds still -- the learned zero point takes the bias out of the reported velocity, the
+    // integrated angle and the direction, so a still controller's aim creeps nowhere (TotK's gyro aiming crept to one side until this)
+    float dps = (float)M_PI / 180;
+    motion_reset(&s);
+    run(&s, &id, 0, 0, -1, 0, 0, 0.5f * dps, 20, 0.5f);
+    motion_fill(&s, acc, gyro, ang, dir);
+    CHECK(fabsf(gyro[2]) < 0.02f * dps / (2 * (float)M_PI), "a resting bias is learned away");
+    float dir1 = dir[1], ang1 = ang[2];
+    run(&s, &id, 0, 0, -1, 0, 0, 0.5f * dps, 5, 0.5f);
+    motion_fill(&s, acc, gyro, ang, dir);
+    CHECK(fabsf(ang[2] - ang1) < 1e-4f && fabsf(dir[1] - dir1) < 1e-3f, "the angle and the direction stop creeping");
+    // a turn after the bias was learned reads whole minus the bias, and learning never runs while it turns
+    run(&s, &id, 0, 0, -1, 0, 0, 30 * dps, 1, 0.5f);
+    motion_fill(&s, acc, gyro, ang, dir);
+    CHECK(fabsf(gyro[2] * 2 * (float)M_PI - 29.5f * dps) < 0.1f * dps, "a turn after learning keeps its whole speed less the bias");
+    motion_reset(&s);
+    run(&s, &id, 0, 0, -1, 0, 0, 10 * dps, 10, 0.5f);
+    motion_fill(&s, acc, gyro, ang, dir);
+    CHECK(fabsf(gyro[2] * 2 * (float)M_PI - 10 * dps) < 0.02f * dps, "no zero is learned from a steady turn");
+    CHECK(fabsf(ang[2] - 10 * dps * 10 / (2 * (float)M_PI)) < 1e-3f, "angle integrates the steady turn");
+    // the switch off: the raw bias stays (DM_MOTION_ZERO=0)
+    motion_reset(&s); s.zero_on = 0;
+    run(&s, &id, 0, 0, -1, 0, 0, 0.5f * dps, 20, 0.5f);
+    motion_fill(&s, acc, gyro, ang, dir);
+    CHECK(near(gyro[2] * 2 * (float)M_PI, 0.5f * dps, 1e-5f), "the raw bias stays with zero-drift off");
+
     // the phone's own sensors: held upright in landscape, screen toward the player, gravity is toward the bottom of the picture (Switch -y) whichever way it is turned
     float up3[3] = {-1, 0, 0}, up4[3] = {1, 0, 0}, flat[3] = {0, 0, -1}, o[3];
     motion_phone_to_switch(3, up3, o); CHECK(near(o[0], 0, 1e-6f) && near(o[1], -1, 1e-6f) && near(o[2], 0, 1e-6f), "landscape right upright: gravity to the picture's bottom");

@@ -558,11 +558,14 @@ HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoE
 // DM_MOTION=0 publishes neither: every sensor reads as it did before
 enum { MOTION_RING = 32, MOTION_FRESH_NS = 200000000 };
 typedef struct { uint64_t t_ns; float acc[3], gyro[3], quat[4], rot[9], angle[3]; } motion_sample;
-typedef struct { pthread_mutex_t mu; int n, head; motion_sample ring[MOTION_RING]; } motion_src;
+typedef struct { pthread_mutex_t mu; int n, head; gyro_zero zero; motion_sample ring[MOTION_RING]; } motion_src;
 static motion_src g_motion_pad[DM_PLAYERS], g_motion_dev;
 #define MOTION_NEWEST(s) ((s)->head + MOTION_RING - 1) % MOTION_RING   // head is the next slot to write: the newest sample is the one before it
 static int motion_on(void) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_MOTION"); on = e ? !!atoi(e) : 1; } return on;
+}
+static int motion_zero_on(void) {   // DM_MOTION_ZERO=0 keeps the raw bias: for checking a controller's own zero point
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_MOTION_ZERO"); on = e ? !!atoi(e) : 1; } return on;
 }
 static void motion_quat(float rot[9], const float q[4]) {   // the quaternion's direction matrix, row-major
     float x = q[0], y = q[1], z = q[2], w = q[3];
@@ -574,9 +577,11 @@ static void motion_put(motion_src *s, const float acc[3], const float gyro[3], c
     uint64_t now = guest_ns();
     pthread_mutex_lock(&s->mu);
     const motion_sample *prev = s->n ? &s->ring[MOTION_NEWEST(s)] : NULL;
+    float w[3] = { gyro[0], gyro[1], gyro[2] };   // the zero-drift correction of the standard mode, so a resting source's velocity, angle and at-rest answer read clean
+    if (motion_zero_on()) gyro_zero_sample(&s->zero, w, acc, prev && now > prev->t_ns ? (float)(now - prev->t_ns) / 1e9f : 0);
     motion_sample *m = &s->ring[s->head];
     m->t_ns = now;
-    for (int i = 0; i < 3; i++) { m->acc[i] = acc[i]; m->gyro[i] = gyro[i] / (float)(2 * M_PI); }   // rad/s in, revolutions/s out
+    for (int i = 0; i < 3; i++) { m->acc[i] = acc[i]; m->gyro[i] = w[i] / (float)(2 * M_PI); }   // rad/s in, revolutions/s out
     for (int i = 0; i < 4; i++) m->quat[i] = quat[i];
     motion_quat(m->rot, quat);
     for (int i = 0; i < 3; i++)   // the trapezoid of the two samples' velocities over their gap
@@ -640,14 +645,15 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Switch frame, DmGamepad.m): while a player's samples keep arriving (within
 // MOTION_STALE_NS on the host clock) their six-axis sensor reports them (motion_fusion.h) instead of lying flat; a shake (DM_BTN_SHAKE) still adds its side-to-side acceleration.
 // Every history entry is the newest sample, numbered by time. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
-// DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
+// DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_ZERO=0 keeps the gyro's raw bias (motion_fusion.h, gyro_zero); DM_MOTION_LOG=1 logs player 1's mapped sample
+// once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
 typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
 static pthread_once_t g_motion_once = PTHREAD_ONCE_INIT;
-static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode;
+static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode, g_motion_zero = 1;
 static void motion_env(void) {
     const char *e = getenv("DM_MOTION"); g_motion_off = e && !atoi(e);
     if (!motion_map_parse(&g_motion_map, getenv("DM_MOTION_AXES"))) LOG("[hid] DM_MOTION_AXES='%s' is not like \"x,-z,y\": using x,y,z", getenv("DM_MOTION_AXES"));
@@ -655,6 +661,7 @@ static void motion_env(void) {
     if ((e = getenv("DM_MOTION_GAIN"))) g_motion_gain = (float)atof(e);
     g_motion_log = (e = getenv("DM_MOTION_LOG")) && atoi(e);
     e = getenv("DM_PHONE_MOTION"); g_phone_mode = !e || !strcmp(e, "auto") ? -1 : !!atoi(e);
+    if ((e = getenv("DM_MOTION_ZERO"))) g_motion_zero = !!atoi(e);
 }
 static void motion_set(int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
     if (p < 0 || p >= DM_PLAYERS || (source == 1 && p)) return;
@@ -668,6 +675,7 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
     if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; }
     if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
+    m->st.zero_on = g_motion_zero;
     motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
@@ -974,7 +982,7 @@ HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi", "debug pad sta
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "six-axis sensor fusion; ignored by the host", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion: off", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "gyroscope zero-drift mode: standard", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }
-HLE_FORCE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", "gyroscope zero-drift mode; ignored by the host", void, h_hid_GyroSet, const uint32_t *h, const int *m) { (void)h; (void)m; }
+HLE_FORCE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", "gyroscope zero-drift mode: standard however it is set (the zero point is re-learned at rest, motion_fusion.h gyro_zero)", void, h_hid_GyroSet, const uint32_t *h, const int *m) { (void)h; (void)m; }
 HLE_FORCE("_ZN2nn3hid32GetSixAxisSensorFusionParametersEPfS1_RKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion parameters: 0", void, h_hid_FusionGet, float *a, float *b, const uint32_t *h) { (void)h; *a = 0; *b = 0; }
 HLE_FORCE("_ZN2nn3hid32SetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleEff", "six-axis sensor fusion parameters; ignored by the host", void, h_hid_FusionSet, const uint32_t *h, float a, float b) { (void)h; (void)a; (void)b; }
 HLE_FORCE("_ZN2nn3hid34ResetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion parameters; ignored by the host", void, h_hid_FusionReset, const uint32_t *h) { (void)h; }

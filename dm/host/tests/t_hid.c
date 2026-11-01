@@ -233,6 +233,11 @@ static void t_motion(void) {
     // The console sensor reads the same source (player 1's rule: the device's now): its layout carries the velocity at 0x18, the angle at 0x24 and the quaternion at 0x30
     CHECK(h_hid_SevenStates(sv, 2) == 2 && sv[0].gyro[0] == 0 && sv[0].quat[3] == 1 && sv[0].sampling == sv[1].sampling + 1 && sv[0].attributes == 1, "the console sensor serves the device source, newest first");
 
+    // The ring learns the same zero point (gyro_zero): a controller IMU at rest with a raw yaw bias reports no velocity once the bias is learned, so a still controller's
+    // aim creeps nowhere however large its zero error (TotK's gyro aiming crept to one side until this)
+    for (int i = 0; i < 1500; i++) { g_now += 10000000; dm_motion_pad(1, (float[3]){0.9f, 0.1f, -0.42f}, (float[3]){0, 0, 0.5f * pi / 180}, dquat); }
+    CHECK(six_states(s, 1, h2[0]) == 1 && fabsf(s[0].gyro[2] * 2 * pi) < 0.02f * pi / 180, "a resting ring source's bias is learned away");
+
     // A shake replaces the real data while it lasts, whole cycles, and the real data comes back after it
     dm_motion_device((float[3]){0.4f, 0, -1}, (float[3]){8 * pi, 8 * pi, 8 * pi}, dquat);   // moving: not at rest, fresh for the shake window
     CHECK(h_hid_SixRest(&h1[0]) == 0 && h_hid_SevenRest() == 0, "a moving source is not at rest");
