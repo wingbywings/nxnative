@@ -1101,11 +1101,12 @@ def nro_modules(g, exe_dir, nros):
     return set_keys(g, {'modules': (' '.join(mods), f'the NROs the game loads at run time import from {why}, which main does not')}, 'After the NRO collection')
 
 
-def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False, *, nsp_dir=None):
+def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False, *, nsp_dir=None, bake_cheats=True):
     """patch_nso.py on every code module (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log, as many at once as the Mac has cores.
     The modules are the profile's and the NROs the game registers (collect_nros; nro.tsv beside them lists those); a provisional profile first gets the subsdks those NROs import from (nro_modules).
-    Reused when the modules, patch_nso.py (with nso.py, nso_code.py, nso_asm.py and the selected profile's function rules / the patch files of their builds), its switches and capstone are as at the
-    last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min). Returns the profile"""
+    Reused when the modules, patch_nso.py (with nso.py, nso_code.py, nso_asm.py and the selected profile's function rules / the patch files of their builds), its switches and capstone are as at their
+    last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min). bake_cheats: bake the game folder's cheat table in (iOS, whose sealed code pages no run-time cheat can write); a Mac
+    build passes False and leaves every code site to the run-time engine (DM_CHEATS, hle_cheats.c), whose panel must refuse a baked site (main.changed.tsv lists it). Returns the profile"""
     import capstone
     PROG.stage('rewrite', step='checking the inputs')
     nro_dir = out.with_name('nro_' + out.name.removeprefix('patched_'))
@@ -1115,8 +1116,8 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False, *, nsp_dir=
     manifest = nro_dir / 'nro.tsv'
     src = {m: exe_dir / m for m in mods} | nros
     names = list(src)
-    cheat_file = None   # cheat patches baked in from the game folder's cheat file (code-write cheats cannot run at run time on iOS)
-    if 'main' in mods: cheat_file = cheat_table_for(nsp_dir, exe_dir / 'main')
+    cheat_file = None   # cheat patches baked in from the game folder's cheat file: iOS only (code-write cheats cannot run at run time there); a Mac build leaves the code sites to the run-time engine
+    if bake_cheats and 'main' in mods: cheat_file = cheat_table_for(nsp_dir, exe_dir / 'main')
     # All supported variants bake, including disabled ones. Runtime toggles do not change the rewritten module.
     kf = out.with_name(out.name + '.key')
     # the repository profile's build rows decide which builds the rewriter treats as the game's own (SDK-wide function patches skip those), so they are an input too
@@ -2043,13 +2044,14 @@ def mac_host(py, repo, work, env, logs, g):
 def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, env_file=''):
     """The command that runs the game in a window with sound after a Mac-only build (PLATFORM 'mac'; docs/development.md, Build by hand (Mac), step 5): its save and temporary storage in
     <id>_build/run (kept from run to run), the extracted RomFS, the Mac shader libraries (msl), the DLC, the profile's shader map (a host outside dm/host does not find it beside itself;
-    c1_full.tsv and cb_extent.tsv are read beside it), the game language, and the switches of an environment file (DM_ENV_FILE / --env-file)"""
+    c1_full.tsv and cb_extent.tsv are read beside it), the game language, the game folder's cheats folder (DM_CHEATS: the run-time engine with the Cheats panel, whose code writes a Mac
+    build never bakes away), and the switches of an environment file (DM_ENV_FILE / --env-file)"""
     rd = work / 'run'
     for d in ('save', 'temp'): (rd / d).mkdir(parents=True, exist_ok=True)
     renv = {'DM_ROOT': work, 'DM_ROMFS': rfs.source(game), 'DM_SAVE': rd / 'save', 'DM_TEMP': rd / 'temp', 'DM_MSL_DIR': msl, 'DM_FONT_DIR': font}
     if aoc: renv['DM_AOC_DIR'] = aoc
-    tbl = cheat_table_for(work.parent, game / 'ExeFS' / 'main')   # the game folder's cheat table runs from the Mac host as well (code writes included: the Mac's code pages can be unsealed)
-    if tbl: renv['DM_CHEATS_DIR'] = tbl.parent
+    tbl = cheat_table_for(work.parent, game / 'ExeFS' / 'main')   # the game folder's cheat table runs from the Mac host as well (code writes included: the Mac's code pages can be unsealed, and a Mac build bakes nothing)
+    if tbl: renv['DM_CHEATS'] = tbl.parent   # the run-time engine with the Cheats panel (hle_cheats.c); DM_CHEATS_DIR would select the legacy engine (hle_cheat.c), which has no Mac panel
     if gfx == 'nvn': renv['DM_NVN_SHMAP'] = g.table('shader_map.tsv')
     renv.update(DM_LANG=lang, DM_WINDOW=1, DM_AUDIO=1)
     if env_file: renv.update(env_file_pairs(env_file))
@@ -2422,7 +2424,7 @@ def main(args=None):
         + (f'; the game\'s languages: {" ".join(have)}' if have else '; the control data lists no languages (not checked)') + (' (DM_LANG=<code> in the run command changes it)' if mac else ' (DM_LANG=<code> in the app\'s Documents/env.txt changes it)'))
 
     patched = work / f'patched_{pkg_ver}'
-    g = rewrite(py, repo, game / 'ExeFS', patched, env, logs, g, provisional, nsp_dir=nsp_dir)
+    g = rewrite(py, repo, game / 'ExeFS', patched, env, logs, g, provisional, nsp_dir=nsp_dir, bake_cheats=not mac)
     chain_header(py, repo, env, logs)   # before any host is built
     if provisional or derived:   # the keys that need the rewritten modules, then (provisional) the heap check (both only change keys the host is built with, not the rewrite or the shader steps)
         provisional_prep(py, repo, env, logs, g)

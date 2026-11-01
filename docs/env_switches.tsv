@@ -18,7 +18,7 @@ DM_CHEATS_DEBUG	diagnostic	Logs every memory write a cheat makes and the cheat f
 DM_CHEATS_DIR	path	Fork cheat table directory; contains build-ID text files and toggles.txt.
 DM_CHEATS_ON	switch	Comma-separated cheat names turned on at launch, besides the saved per-build enabled states
 DM_CHEATS_WINDOW	switch	`1` opens the Mac Cheats panel beside the game from the start
-DM_CHEAT_FILE	path	Atmosphere table baked into the main module by the rewriter.
+DM_CHEAT_FILE	path	Atmosphere table baked into the main module by the rewriter; iOS builds only (a Mac build leaves code sites to the run-time engine of DM_CHEATS).
 DM_CHEAT_LOG	diagnostic	Log each instruction executed by the fork cheat VM.
 DM_CHEAT_MENU_KEYS	player	Buttons held to open the fork in-game cheat menu; default L+R+ZL+ZR.
 DM_CHEAT_RATE	player	Fork cheat VM passes per second; default 12, bounded to 1 through 1000.
