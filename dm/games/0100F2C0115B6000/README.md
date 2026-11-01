@@ -82,7 +82,7 @@ Game-specific findings. The general host changes they led to are listed under [F
 
 - **Repeated prepare after a database-capacity error:** [bounded pipeline archive writes and completion receipts](../../../docs/reference/shaders.md#pipeline-archive-database-capacity-repeats-the-prepare-step).
 
-- **Gyro aiming crept to the right on a still controller (2026-11-01):** [The view creeps while the controller rests](../../../docs/reference/services.md#the-view-creeps-while-the-controller-rests). The raw gyro's bias was reported and integrated with nothing re-zeroing it; the Pro Controller's HID samples carry the largest bias of the sources. Covered by `t_motion` and `t_hid`; a Mac run with the controller held still is the remaining check (`DM_MOTION_LOG=1` shows the mapped sample, `DM_MOTION_ZERO=0` shows the raw bias).
+- **Gyro drift: host correction implemented; iPhone retest open (2026-11-01):** The same iPhone/Bluetooth Pro report is backed by the player's Breath of the Wild desk-rest log. The shared filter now uses stable gravity to bootstrap larger observable bias instead of requiring that bias to pass the old raw-speed gate. See [The view creeps while the controller rests](../../../docs/reference/services.md#the-view-creeps-while-the-controller-rests) for evidence, regression tests and limitations. The inclined portion was hand-held, not a supported fixture; no post-fix device result is claimed.
 
 General host changes first needed here; each applies to every game:
 

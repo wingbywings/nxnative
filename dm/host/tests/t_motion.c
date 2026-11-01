@@ -12,6 +12,60 @@ static void run(motion_state *s, const motion_map *m, float ax, float ay, float 
     for (int i = 0; i < n; i++) motion_update(s, m, a, w, 1 / 250.f, k);
 }
 
+static void t_gravity_bias(const motion_map *m) {
+    const float dps = (float)M_PI / 180;
+    // Rounded GameController samples from the player's BotW log (7606506c): the first pose was resting on a desk, the second held inclined.
+    // The old 2 dps raw gate never opened for the desk's ~3.78 dps bias, and its 3 dps component cap could not remove the -3.6 dps on y.
+    const float poses[][3] = {{-.07f, .12f, -1.14f}, {.49f, .27f, -.91f}};
+    const float bias[3] = {1.08f * dps, -3.6f * dps, -.36f * dps};
+    for (unsigned p = 0; p < sizeof poses / sizeof poses[0]; p++) {
+        motion_state s; motion_reset(&s); const float *a = poses[p];
+        run(&s, m, a[0], a[1], a[2], bias[0], bias[1], bias[2], 25, .5f);
+        motion_state before = s;
+        run(&s, m, a[0], a[1], a[2], bias[0], bias[1], bias[2], 10, .5f);
+        float delta = 0;
+        for (int i = 0; i < 3; i++) {
+            CHECK(fabsf(s.gyro[i]) * 360 < .01f, "logged large bias: corrected velocity settles at either pose");
+            CHECK(fabsf(s.angle[i] - before.angle[i]) * 360 < .02f, "logged large bias: angle stops drifting");
+            for (int j = 0; j < 3; j++) delta = fmaxf(delta, fabsf(s.R[i][j] - before.R[i][j]));
+        }
+        CHECK(delta < .001f, "logged large bias: direction stops drifting");
+        // A turn starts immediately after calibration: even its first sample must keep the new velocity.
+        float turn[3] = {bias[0], bias[1] + 5 * dps, bias[2]};
+        motion_update(&s, m, a, turn, .01f, .5f);
+        CHECK(fabsf(s.gyro[1] * 360 - 5) < .02f, "large learned bias: first aiming sample keeps its speed");
+    }
+    // Gravity cannot distinguish a steady heading turn from a bias parallel to gravity: never bootstrap that component merely because acceleration is constant.
+    motion_state s; motion_reset(&s);
+    run(&s, m, 0, 0, -1, 0, 0, 3.6f * dps, 30, .5f);
+    CHECK(fabsf(s.gyro[2] * 360 - 3.6f) < .001f, "steady yaw is not calibrated out by stationary gravity");
+    motion_reset(&s);
+    run(&s, m, 0, -.6f, -.8f, 0, 3.6f * .6f * dps, 3.6f * .8f * dps, 30, .5f);
+    CHECK(fabsf(s.gyro[1] * 360 - 3.6f * .6f) < .001f && fabsf(s.gyro[2] * 360 - 3.6f * .8f) < .001f,
+          "steady world yaw remains intact at an inclined pose");
+    // Real tilt changes gravity. A slow 5 dps turn over 10 s must not be mistaken for a large bias.
+    motion_reset(&s);
+    for (int i = 0; i < 1000; i++) {
+        float t = (float)i * .01f, a[3] = {0, -sinf(5 * dps * t), -cosf(5 * dps * t)}, w[3] = {5 * dps, 0, 0};
+        motion_update(&s, m, a, w, .01f, .5f);
+    }
+    CHECK(fabsf(s.gyro[0] * 360 - 5) < .01f, "changing gravity preserves deliberate pitch");
+    // Learning on the desk must survive hand tremor when the controller is picked up. This is synthetic 5 Hz pitch motion, not a replay of the log's 1 Hz snapshots.
+    motion_reset(&s);
+    run(&s, m, 0, 0, -1, bias[0], bias[1], bias[2], 25, .5f);
+    for (int i = 0; i < 2000; i++) {
+        float t = (float)i * .01f, th = .2f * dps * sinf(10 * (float)M_PI * t), speed = 2 * (float)M_PI * dps * cosf(10 * (float)M_PI * t);
+        float a[3] = {0, -sinf(th), -cosf(th)}, w[3] = {bias[0] + speed, bias[1], bias[2]};
+        motion_update(&s, m, a, w, .01f, .5f);
+        if (i == 1999) CHECK(fabsf(s.gyro[0] * 360 - speed / dps) < .1f, "hand tremor is still reported after desk calibration");
+    }
+    CHECK(fabsf(s.zero.bias[1] - bias[1]) / dps < .01f, "hand tremor keeps the learned y offset");
+    gyro_zero before = s.zero;
+    float a[3] = {0, 0, -1}, w[3] = {0, 1, 0};
+    gyro_zero_sample(&s.zero, w, a, 1);
+    CHECK(s.zero.gravity_s == 0 && s.zero.rest_s == 0 && s.zero.bias[1] == before.bias[1], "a sample gap resets evidence but preserves calibration");
+}
+
 int main(void) {
     motion_map m;
     CHECK(motion_map_parse(&m, NULL) && m.src[0] == 0 && m.det == 1, "default map is the identity");
@@ -23,6 +77,7 @@ int main(void) {
 
     // flat and still: identity orientation, acc (0,0,-1), no rotation
     motion_map id; motion_map_parse(&id, NULL);
+    t_gravity_bias(&id);
     motion_state s; motion_reset(&s);
     run(&s, &id, 0, 0, -1, 0, 0, 0, 1, 0.5f);
     float acc[3], gyro[3], ang[3], dir[9];
@@ -100,6 +155,25 @@ int main(void) {
     run(&s, &id, 0, 0, -1, 0, 0, 0.5f * dps, 5, 0.5f);
     motion_fill(&s, acc, gyro, ang, dir);
     CHECK(fabsf(ang[2] - ang1) < 1e-4f && fabsf(dir[1] - dir1) < 1e-3f, "the angle and the direction stop creeping");
+    // iPhone + Bluetooth Pro: aiming reportedly holds still only while flat. Exercise bias on every body axis, including y (which becomes world yaw when held upright),
+    // at pitched, rolled and compound poses. Learning and a settled orientation must not depend on lying face up.
+    const float poses[][3] = {{0, 0, -1}, {0, -0.70710678f, -0.70710678f}, {0, -1, 0},
+                             {0.70710678f, 0, -0.70710678f}, {0.5f, -0.5f, -0.70710678f}, {0, 0, 1}};
+    for (unsigned p = 0; p < sizeof poses / sizeof poses[0]; p++) for (int axis = 0; axis < 3; axis++) {
+        motion_state tilted; motion_reset(&tilted);
+        const float *a = poses[p]; float w[3] = {0}; w[axis] = 0.5f * dps;
+        run(&tilted, &id, a[0], a[1], a[2], w[0], w[1], w[2], 20, 0.5f);
+        motion_state before = tilted;
+        run(&tilted, &id, a[0], a[1], a[2], w[0], w[1], w[2], 10, 0.5f);
+        float delta = 0;
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) delta = fmaxf(delta, fabsf(tilted.R[i][j] - before.R[i][j]));
+        CHECK(fabsf(tilted.gyro[axis]) * 360 < 0.001f, "every pose: body-axis bias is learned away");
+        CHECK(fabsf(tilted.angle[axis] - before.angle[axis]) * 360 < 0.01f, "every pose: settled angle stays still");
+        CHECK(delta < 0.0002f, "every pose: settled direction stays still");
+        float gravity_dot = 0;
+        for (int i = 0; i < 3; i++) gravity_dot -= tilted.R[2][i] * a[i];
+        CHECK(near(gravity_dot, 1, 1e-5f), "every pose: direction agrees with measured gravity");
+    }
     // a turn after the bias was learned reads whole minus the bias, and learning never runs while it turns
     run(&s, &id, 0, 0, -1, 0, 0, 30 * dps, 1, 0.5f);
     motion_fill(&s, acc, gyro, ang, dir);

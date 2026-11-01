@@ -679,8 +679,19 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
     motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
-        LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
+        LOG("[hid] motion player 1 (%s): acc %+.4f %+.4f %+.4f G, gyro %+.6f %+.6f %+.6f rev/s (flat and still should read acc 0 0 -1)",
             source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
+        // A tilted controller can expose bias on an axis that contributes no yaw while flat. Log the input and learning gate separately from the corrected output;
+        // rounded rev/s alone hid small aiming drift and could not distinguish an inactive zero filter from an orientation/gravity mismatch.
+        float raw[3]; const motion_map *map = source ? &identity : &g_motion_map;
+        motion_map_apply(map, rot, raw, map->det);
+        const float dps = 180.f / (float)M_PI;
+        LOG("[hid] motion diagnostic (%s): dt %.3f ms, raw %+.4f %+.4f %+.4f dps, bias %+.4f %+.4f %+.4f dps, lp %+.4f %+.4f %+.4f dps, rest %.3f s, gravity-stable %.3f s, zero %d, gravity %+.4f %+.4f %+.4f G",
+            source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", dt * 1000,
+            raw[0] * dps, raw[1] * dps, raw[2] * dps,
+            m->st.zero.bias[0] * dps, m->st.zero.bias[1] * dps, m->st.zero.bias[2] * dps,
+            m->st.zero.lp[0] * dps, m->st.zero.lp[1] * dps, m->st.zero.lp[2] * dps, m->st.zero.rest_s, m->st.zero.gravity_s, m->st.zero_on,
+            -m->st.R[2][0], -m->st.R[2][1], -m->st.R[2][2]);
     }
     m->last_ns = t; m->received_ns = now;
     pthread_mutex_unlock(&m->mu);

@@ -13,13 +13,12 @@
 #include <stdlib.h>
 
 typedef struct { int src[3]; float sign[3]; float acc_sign; float det; } motion_map;
-// The console's standard zero-drift mode (GetGyroscopeZeroDriftMode): while the sensor rests -- the low-passed angular velocity quiet, gravity alone in the accelerometer -- the
-// gyro's zero point is slowly re-learned and subtracted from every sample, so a controller nobody turns holds still however large its raw bias (the Pro Controller's factory
-// offsets are out of reach of the passive reader, motion_pro.h; hle_hid.c's rings learn the same on their own path). A turn does not feed it: learning waits GZ_WARM_S of quiet,
-// never takes a sample above GZ_RAW_DPS (so the turn's first samples, still quiet in the low pass, cannot move it) and follows with a seconds-scale time constant, capped at
-// GZ_MAX_DPS. A perfectly steady turn slower than GZ_QUIET_DPS is beyond telling from a bias, as on the console itself.
-enum { GZ_QUIET_DPS = 2, GZ_RAW_DPS = 4, GZ_WARM_S = 1, GZ_TAU_S = 3, GZ_MAX_DPS = 3 };
-typedef struct { float bias[3], lp[3]; float rest_s; int primed; } gyro_zero;
+// Zero-drift correction is shared by the live integrator and hle_hid.c's rings. A raw-speed gate alone cannot bootstrap a bias larger than its quiet threshold (iOS Pro:
+// -3.6 dps on y). Stable gravity provides an independent observation: dg/dt = g cross w, so with g unchanged the component of w perpendicular to g is bias. Learn only that
+// observable component after two seconds of stable acceleration and gyro; never infer yaw from gravity. Then the usual quiet gate, measured after subtracting the learned
+// bias, can learn the remaining small offset. A steady yaw faster than GZ_QUIET_DPS remains unobservable and is preserved; slower steady yaw and bias remain ambiguous.
+enum { GZ_QUIET_DPS = 2, GZ_RAW_DPS = 4, GZ_WARM_S = 1, GZ_TAU_S = 3, GZ_GRAVITY_WARM_S = 2 };
+typedef struct { float bias[3], lp[3], gravity_ref[3]; float rest_s, gravity_s; int primed; } gyro_zero;
 typedef struct {
     float R[3][3];        // controller -> world (columns = the controller's axes in the world)
     float angle[3];       // integrated revolutions per axis
@@ -56,23 +55,47 @@ static inline void motion_map_apply(const motion_map *m, const float in[3], floa
 // Corrects w (rad/s, the frame motion_update works in) in place by the learned zero point; a is the mapped acceleration (G) for the rest gate, dt as motion_update's
 static inline void gyro_zero_sample(gyro_zero *z, float w[3], const float a[3], float dt) {
     if (dt > 0 && dt <= 0.25f) {
-        if (!z->primed) { for (int i = 0; i < 3; i++) z->lp[i] = w[i]; z->primed = 1; }
+        if (!z->primed) {
+            for (int i = 0; i < 3; i++) { z->lp[i] = w[i]; z->gravity_ref[i] = a[i]; }
+            z->primed = 1;
+        }
         float fl = 1 - expf(-dt / 0.25f);   // the quiet gate reads the low-passed velocity, so hand tremor spikes do not keep the rest from counting
         for (int i = 0; i < 3; i++) z->lp[i] += (w[i] - z->lp[i]) * fl;
-        float wl = sqrtf(z->lp[0] * z->lp[0] + z->lp[1] * z->lp[1] + z->lp[2] * z->lp[2]);
-        float wr = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
         float n = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        float da2 = 0, dw2 = 0;
+        for (int i = 0; i < 3; i++) {
+            float da = a[i] - z->gravity_ref[i], dw = w[i] - z->lp[i];
+            da2 += da * da; dw2 += dw * dw;
+        }
+        const float jitter = 0.5f * (float)M_PI / 180;
+        float k = 1 - expf(-dt / (float)GZ_TAU_S);
+        // Compare gravity to an anchored sample, not the previous one: a smooth deliberate tilt must accumulate enough displacement to reset the observation window.
+        if (n > 0.8f && n < 1.2f && da2 < 0.02f * 0.02f && dw2 < jitter * jitter) {
+            z->gravity_s += dt;
+            if (z->gravity_s >= (float)GZ_GRAVITY_WARM_S) {
+                float g[3], along = 0;
+                for (int i = 0; i < 3; i++) { g[i] = a[i] / n; along += (z->lp[i] - z->bias[i]) * g[i]; }
+                for (int i = 0; i < 3; i++) z->bias[i] += k * (z->lp[i] - z->bias[i] - along * g[i]);
+            }
+        } else {
+            z->gravity_s = 0;
+            for (int i = 0; i < 3; i++) z->gravity_ref[i] = a[i];
+        }
+        float wl2 = 0, wr2 = 0;
+        for (int i = 0; i < 3; i++) {
+            float l = z->lp[i] - z->bias[i], r = w[i] - z->bias[i];
+            wl2 += l * l; wr2 += r * r;
+        }
+        float wl = sqrtf(wl2), wr = sqrtf(wr2);
         if (wl < (float)GZ_QUIET_DPS * (float)M_PI / 180 && n > 0.8f && n < 1.2f) {
             z->rest_s += dt;
             if (z->rest_s >= (float)GZ_WARM_S && wr < (float)GZ_RAW_DPS * (float)M_PI / 180) {
-                float k = 1 - expf(-dt / (float)GZ_TAU_S), cap = (float)GZ_MAX_DPS * (float)M_PI / 180;
                 for (int i = 0; i < 3; i++) {
                     z->bias[i] += (z->lp[i] - z->bias[i]) * k;   // toward the low-passed velocity: the DC part is the zero point, a passing spike weighs its filtered share
-                    if (z->bias[i] > cap) z->bias[i] = cap; else if (z->bias[i] < -cap) z->bias[i] = -cap;
                 }
             }
         } else z->rest_s = 0;
-    } else { z->primed = 0; z->rest_s = 0; }   // a gap: nothing is learned across it, what was learned stays
+    } else { z->primed = 0; z->rest_s = 0; z->gravity_s = 0; }   // a gap: nothing is learned across it, what was learned stays
     for (int i = 0; i < 3; i++) w[i] -= z->bias[i];
 }
 static inline void motion_reset(motion_state *s) {
