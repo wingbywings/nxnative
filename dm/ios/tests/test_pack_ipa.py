@@ -37,6 +37,21 @@ class PackIpa(unittest.TestCase):
         self.maps = [f'Payload/DmIOS.app/romfs={self.rom}', f'Payload/DmIOS.app={self.app}']
         self.out = self.tmp / 'a.ipa'
 
+    def test_pulling_validation_checks_packed_entries(self):
+        shaders = self.tmp / 'shaders'; shaders.mkdir()
+        (shaders / 'v_b.json').write_text(json.dumps({'pull': {}}))
+        (shaders / 'f_b.json').write_text(json.dumps({'entry': 'main0'}))
+        mappings = [('Payload/DmIOS.app/msl/b-fixture', str(shaders))]
+        with self.assertRaisesRegex(SystemExit, 'missing pulling library'):
+            pack.verify_pulling(pack.entries(mappings, set()))
+        (shaders / 'v_bp.metallib').write_bytes(b'library')
+        pack.verify_pulling(pack.entries(mappings, set()))
+        with self.assertRaisesRegex(SystemExit, 'missing pulling library'):
+            pack.verify_pulling(pack.entries(mappings, set(), ('_bp.metallib',)))
+        (shaders / 'v_bp.metallib').write_bytes(b'')
+        with self.assertRaisesRegex(SystemExit, 'missing pulling library'):
+            pack.verify_pulling(pack.entries(mappings, set()))
+
     def run_pack(self, out=None, *opts, big=pack.BIG):
         out = out or self.out
         self.kept = self.reused = 0

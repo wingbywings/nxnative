@@ -13,10 +13,10 @@ import game
 
 
 class ProfilePackTests(unittest.TestCase):
-    def test_pulling_libraries_follow_compiled_profile_and_explicit_override(self):
-        # (game, IOS_PULL, with a pipeline archive, _bp libraries packed): an archive's bases are made of the pulling libraries, so an IPA with one carries them whatever IOS_PULL says
-        cases = [('01007EF00011E000', None, False, True), ('010015100B514000', None, False, False),
-                 ('01007EF00011E000', '0', False, False), ('010015100B514000', '1', False, True),
+    def test_pulling_libraries_available_for_runtime_settings(self):
+        # Runtime Metal 4 remains available regardless of the profile default or legacy IOS_PULL override.
+        cases = [('01007EF00011E000', None, False, True), ('010015100B514000', None, False, True),
+                 ('01007EF00011E000', '0', False, True), ('010015100B514000', '1', False, True),
                  ('010015100B514000', None, True, True), ('01007EF00011E000', '0', True, True)]
         for gid, override, with_pso, included in cases:
             with self.subTest(game=gid, IOS_PULL=override, archive=with_pso), tempfile.TemporaryDirectory() as temporary:
@@ -28,7 +28,7 @@ class ProfilePackTests(unittest.TestCase):
                 app, shaders, romfs = [root / name for name in ('DmIOS.app', 'shaders', 'romfs')]
                 for folder in (app, shaders / 'b-fixture', romfs): folder.mkdir(parents=True)
                 for name in ('fixture_b.metallib', 'fixture_bp.metallib', 'fixture_bv.metallib', 'fixture_b.json'):
-                    (shaders / 'b-fixture' / name).write_text(name)
+                    (shaders / 'b-fixture' / name).write_text('{"pull": {}}' if name.endswith('.json') else name)
                 (app / 'executable').write_text('app')
                 (romfs / 'marker').write_text('romfs')
                 (root / 'tools').symlink_to(REPO / 'dm/ios/tools', target_is_directory=True)

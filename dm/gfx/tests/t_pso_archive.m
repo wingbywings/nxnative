@@ -1,8 +1,8 @@
 // Metal 4 pipelines (pso_build): one base per pipeline with its colour state unspecialized, made into pipelines by specialization, kept in the pipeline archive.
 // Checks: pipelines that differ only in colour state share one base; a specialized pipeline draws the same pixels as one built through the MTLDevice; a flushed archive
 // file serves the base again without compiling; a flush of bases without a vertex layout is a p<seq> file, where a base with a layout is not looked up; a function with no
-// Metal 4 descriptor keeps the MTLDevice path; pso_key_norm drops what no pipeline depends on; compaction merges the files the prewarm took bases from into one despite a
-// mid-prewarm flush, and a compaction that did not finish is not tried again on the same system build; depth-only draws write depth; concurrent colour variants compile
+// Metal 4 descriptor keeps the MTLDevice path; pso_key_norm drops what no pipeline depends on; compaction publishes bounded batches and preserves incomplete/legacy files;
+// a failed compaction is not tried again on the same system build; depth-only draws write depth; concurrent colour variants compile
 // one base; archive flushes preserve unrelated compiler state; a function with function constants is specialized by its pipeline's descriptor, not through its library,
 // and an MTLDevice pipeline gets it specialized
 #include <stdlib.h>
@@ -100,6 +100,14 @@ static void concurrent_functions(id<MTLLibrary> library) {
 - (BOOL)serializeAsArchiveAndFlushToURL:(NSURL *)url error:(NSError **)error {
     calls++; marked += [[NSString stringWithContentsOfFile:arch_compact_marker() encoding:NSUTF8StringEncoding error:nil] isEqualToString:arch_compact_stamp()];
     return [ser serializeAsArchiveAndFlushToURL:url error:error];
+}
+@end
+// Inject the platform/database error at the real serialization boundary.
+@interface FailureSerializer : NSObject { @public int map_full; } @end
+@implementation FailureSerializer
+- (BOOL)serializeAsArchiveAndFlushToURL:(NSURL *)url error:(NSError **)error {
+    if (error) *error = [NSError errorWithDomain:@"archive-test" code:1 userInfo:@{NSLocalizedDescriptionKey:map_full ? @"MDB_MAP_FULL: Environment mapsize limit reached" : @"injected write failure"}];
+    return NO;
 }
 @end
 // Model another compiler creating state before the real compiler call returns.
@@ -284,7 +292,12 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (argc == 3) {
         int seed = !strcmp(argv[1], "--compact-seed");
         pso4_init();
-        EXPECT("restart: opened run archives", seed ? 0 : !strcmp(argv[1], "--compact-replay") ? PSO_ARCH_COMPACT + 1 : 1, g_arch4.count);
+        int replay = !strcmp(argv[1], "--compact-replay") || !strcmp(argv[1], "--compact-fail");
+        if (getenv("DM_TEST_ARCHIVE_BATCH")) g_arch_batch_limit = 3;
+        if (!seed && replay && getenv("DM_TEST_ARCHIVE_BATCH")) {
+            FailureSerializer *failure = [FailureSerializer new]; failure->map_full = getenv("DM_TEST_ARCHIVE_FAIL") == NULL; g_ep->ser = (id<MTL4PipelineDataSetSerializer>)failure;
+        }
+        EXPECT("restart: opened run archives", seed ? 0 : replay ? PSO_ARCH_COMPACT + 1 : getenv("DM_TEST_ARCHIVE_LEGACY") ? 10 : getenv("DM_TEST_ARCHIVE_FAIL") ? 12 : getenv("DM_TEST_ARCHIVE_BATCH") ? 5 : 1, g_arch4.count);
         atomic_store(&g_warm_running, !seed);
         NSMutableArray<MTLRenderPipelineDescriptor *> *descs = [NSMutableArray array];
         for (int i = 0; i <= PSO_ARCH_COMPACT; i++) {
@@ -309,7 +322,7 @@ int main(int argc, char **argv) { @autoreleasepool {
             EXPECT("restart: every base from disk", PSO_ARCH_COMPACT + 1 + (fresh && !compacting), g_pb_archived);
             EXPECT("restart: compiled bases", fresh && compacting, g_pb_built);
             dispatch_sync(g_arch_q, ^{ arch_flush(); });
-            if (g_compact_files) EXPECT("restart: timed flush keeps recaptures pending", PSO_ARCH_COMPACT + 1 + fresh, g_arch_new);
+
             atomic_store(&g_warm_running, 0);
             arch_flush_wait();
         }
@@ -318,6 +331,29 @@ int main(int argc, char **argv) { @autoreleasepool {
         printf("t_pso_archive %s: %d checks, %d failed\n", argv[1], checks, failed);
         return failed != 0;
     }
+    // Resource accounting counts storage, not views; diagnostics do not pin it.
+    __weak id weak_texture;
+    @autoreleasepool {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16 mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        id<MTLTexture> texture = [g_dev newTextureWithDescriptor:td];
+        id<MTLTexture> view = [texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB];
+        weak_texture = texture;
+        NSMapTable *owners = [NSMapTable strongToStrongObjectsMapTable];
+        mem_owner(owners, texture, MEM_SERIAL); mem_owner(owners, view, MEM_SHARED);
+        EXPECT("memory: texture and view count once", 1, owners.count);
+        EXPECT("memory: overlapping owners retained", MEM_SERIAL | MEM_SHARED, [[owners objectForKey:texture] unsignedIntValue]);
+        EXPECT("memory: allocation size counted", texture.allocatedSize, mem_bytes(mem_allocation(view)));
+        MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; td.storageMode = MTLStorageModePrivate;
+        hd.storageMode = MTLStorageModePrivate; hd.size = [g_dev heapTextureSizeAndAlignWithDescriptor:td].size * 2;
+        id<MTLHeap> heap = [g_dev newHeapWithDescriptor:hd];
+        id<MTLTexture> a = [heap newTextureWithDescriptor:td], b = [heap newTextureWithDescriptor:td];
+        EXPECT("memory: heap textures created", 1, a != nil && b != nil);
+        [owners removeAllObjects]; mem_owner(owners, a, MEM_SERIAL); mem_owner(owners, b, MEM_SHARED);
+        EXPECT("memory: heap allocation counted once", 1, owners.count);
+        EXPECT("memory: heap size", heap.size, mem_bytes(mem_allocation(a)));
+    }
+    EXPECT("memory: snapshot leaves no retained texture", 1, weak_texture == nil);
     // pipelines differing only in colour state share one base
     same_pixels("RGBA8 blended, RGBA16F all channels", MTLPixelFormatRGBA8Unorm, 1, MTLPixelFormatRGBA16Float, MTLColorWriteMaskAll);
     EXPECT("first pipeline: its base compiled", 1, g_pb_built);
@@ -360,6 +396,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // compaction: with more than PSO_ARCH_COMPACT files, the bases the prewarm takes from them are captured again; after the flush that follows, one file holds them and the old ones are gone
     {
         char cdir[] = "/tmp/t_pso_compact.XXXXXX"; if (!mkdtemp(cdir)) abort();
+        arch_flush_wait();
         NSString *saved = g_arch_dir; g_arch_dir = @(cdir); nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = @[]; g_arch4p = @[];
         NSMutableArray<MTLRenderPipelineDescriptor *> *descs = [NSMutableArray array];
         for (int i = 0; i <= PSO_ARCH_COMPACT; i++) {   // one base per file: the stride of the layout tells them apart
@@ -368,21 +405,21 @@ int main(int argc, char **argv) { @autoreleasepool {
             if (!pso_build(cd, &err)) { fprintf(stderr, "compaction: no pipeline %d\n", i); failed++; }
             arch_flush_wait();
         }
-        NSArray<NSString *> *names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] sortedArrayUsingSelector:@selector(compare:)];
+        NSArray<NSString *> *names = [[[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]] sortedArrayUsingSelector:@selector(compare:)];
         EXPECT("compaction: one file per flush", PSO_ARCH_COMPACT + 1, names.count);
         NSMutableArray<id<MTL4Archive>> *open = [NSMutableArray array]; NSMutableArray<NSString *> *paths = [NSMutableArray array];
         for (NSString *n in names.reverseObjectEnumerator) { NSString *f = [@(cdir) stringByAppendingPathComponent:n]; [paths addObject:f]; [open addObject:[g_dev newArchiveWithURL:[NSURL fileURLWithPath:f] error:&err]]; }
-        nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = open;   // as a new start with that many files
-        g_compact_enabled = 1; g_compact_files = paths; g_compacted = 0;
+        nvn_hm_clear(&g_pbase, hm_rel); g_arch4 = open;
+        for (NSUInteger i = 0; i < open.count; i++) [g_arch_paths setObject:paths[i] forKey:open[i]];   // as a new start with that many files
+        g_compact_enabled = 1; g_compact_files = paths; g_compacted = 0; g_compact_taken = 0;
+        g_compact_hits = [NSMutableDictionary dictionary];
+        [arch_compact_stamp() writeToFile:arch_compact_marker() atomically:YES encoding:NSUTF8StringEncoding error:nil];
         uint64_t arch0 = g_pb_archived, built0 = g_pb_built;
         ArchEpoch *ep = g_ep; ArchiveGateCompiler *gate = [ArchiveGateCompiler new]; gate->compiler = ep->comp; gate->calls = 1; ep->comp = (id<MTL4Compiler>)gate;
         atomic_store(&g_warm_running, 1);
         for (MTLRenderPipelineDescriptor *cd in descs) pso_build(cd, &err);
         EXPECT("compaction: captures original shader functions, not archive imports", 0, gate->lookup_calls);
         ep->comp = gate->compiler;
-        dispatch_sync(g_arch_q, ^{ arch_flush(); });   // the timer fires while prewarm still has other work
-        EXPECT("compaction: timed flush keeps recaptured bases pending", descs.count, g_arch_new);
-        EXPECT("compaction: timed flush adds no partial file", PSO_ARCH_COMPACT + 1, [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil].count);
         atomic_store(&g_warm_running, 0);
         EXPECT("compaction: every base from the archive", arch0 + descs.count, g_pb_archived);
         EXPECT("compaction: none compiled", built0, g_pb_built);
@@ -391,7 +428,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         arch_flush_wait();
         EXPECT("compaction: the marker exists while the flush writes", 1, ms->calls == 1 && ms->marked == 1);
         EXPECT("compaction: the flush that returned removed the marker", 0, [NSFileManager.defaultManager fileExistsAtPath:arch_compact_marker()]);
-        names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil];
+        names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]];
         EXPECT("compaction: one file left", 1, names.count);
         // a marker left by a compaction that did not finish: the next start on this system build does not compact, one from another build is removed and compaction tried
         EXPECT("compaction: allowed without a marker", 1, arch_compact_allowed());
@@ -411,6 +448,26 @@ int main(int argc, char **argv) { @autoreleasepool {
         EXPECT("compaction: the new file holds every base", arch0 + descs.count, g_pb_archived);
         EXPECT("compaction: none compiled from the new file", built0, g_pb_built);
         [NSFileManager.defaultManager removeItemAtPath:@(cdir) error:nil]; g_arch_dir = saved; g_arch4 = @[];
+    }
+    {
+        arch_flush_wait(); g_compact_taken = 0; g_compact_enabled = 1;
+        g_compact_files = @[[g_arch_dir stringByAppendingPathComponent:@"keep-old.mtl4a"]];
+        [@"old" writeToFile:g_compact_files[0] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [arch_compact_stamp() writeToFile:arch_compact_marker() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        MTLRenderPipelineDescriptor *cd = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
+        cd.vertexDescriptor.layouts[16].stride = 8192;
+        EXPECT("write failure: pipeline builds", 1, pso_build(cd, &err) != nil);
+        g_ep->ser = (id<MTL4PipelineDataSetSerializer>)[FailureSerializer new];
+        arch_flush_wait();
+        EXPECT("write failure: counted", 1, g_arch_failures > 0);
+        EXPECT("write failure: old file kept", 1, [NSFileManager.defaultManager fileExistsAtPath:g_compact_files[0]]);
+        EXPECT("write failure: marker kept", 1, [NSFileManager.defaultManager fileExistsAtPath:arch_compact_marker()]);
+        EXPECT("write failure: no false prebuild completion", 0, pre_receipt_write(@"test", @"resources"));
+        EXPECT("write failure: no stamp", 0, [NSFileManager.defaultManager fileExistsAtPath:[g_arch_dir stringByAppendingPathComponent:@"prebuilt.tsv"]]);
+        EXPECT("write failure: no repeated compaction", 0, arch_compact_allowed());
+        g_compact_enabled = 0; g_compact_files = nil; g_arch_failures = 0;
+        unlink(arch_compact_marker().fileSystemRepresentation);
+        unlink([g_arch_dir stringByAppendingPathComponent:@"keep-old.mtl4a"].fileSystemRepresentation);
     }
     // a function with no Metal 4 descriptor: the MTLDevice path
     uint64_t legacy = g_pb_legacy;

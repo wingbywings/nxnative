@@ -7,7 +7,7 @@
 # Usage: pack_ipa.py <out.ipa> [--store .a:.b] [--skip <archive path>]... <archive path>=<source file or folder>...
 #   Mappings are packed in command-line order; put the files that change least first, and the app last
 #   --skip: an archive path left out of the walk of the folder that holds it (folders a stale app build still has, the signature); a mapping of its own still adds it
-#   --skip-suffix: files whose names end so are left out of every walk (build_ipa.sh: the pulling vertex libraries _bp.metallib when the profile's pso_mtl4 is off, unless IOS_PULL overrides it)
+#   --skip-suffix: files whose names end so are left out of every walk
 #   Writes <out.ipa>.partial and renames it at the end; prints "pack: N entries, X bytes" first (the NSP script's progress total, X = the files' bytes) and a summary line last
 #   Repeat packs reuse a file when its size, mtime_ns, ctime_ns and inode are unchanged (true on APFS). A tool that rewrites in place and restores mtime defeats this if ctime also stays
 #   unchanged; --no-reuse forces a full pack. The index holds only source metadata and compression settings; ZIP metadata comes from the old IPA.
@@ -53,6 +53,22 @@ def entries(maps, skip, skip_suffix=()):
         if stat.S_ISREG(source_stat.st_mode): add(arc, src, source_stat)
         else: add(arc + '/', src, source_stat); walk(src, arc)
     return out
+
+
+def verify_pulling(es):
+    """Validate the actual archive entries, including exclusions, before replacing an IPA."""
+    by_name = {e.name: e for e in es}
+    for e in es:
+        if not e.name.endswith('_b.json'):
+            continue
+        with open(e.path, encoding='utf-8') as f:
+            reflection = json.load(f)
+        if not isinstance(reflection.get('pull'), dict):
+            continue
+        name = e.name[:-7] + '_bp.metallib'
+        library = by_name.get(name)
+        if library is None or library.st is None or library.st.st_size == 0:
+            sys.exit(f'[RED] pack_ipa: missing pulling library {name}; runtime Metal 4 settings require it')
 
 
 def load(path, deflate):   # in the pool: (method, CRC, the bytes to write, uncompressed length)
@@ -230,6 +246,7 @@ def main():
     ap.add_argument('out'); ap.add_argument('maps', nargs='+', metavar='archive_path=source')
     ap.add_argument('--store', default='', help='suffixes stored without compressing, separated by ":"')
     ap.add_argument('--skip', action='append', default=[], help='an archive path left out of the folder walk that would add it')
+    ap.add_argument('--verify-pulling', action='store_true', help='require every pulling library declared by shader reflection')
     ap.add_argument('--skip-suffix', action='append', default=[], help='files whose names end so are left out of every folder walk')
     ap.add_argument('--no-reuse', action='store_true', help='pack every file again, without copying from the old IPA')
     a = ap.parse_args()
@@ -242,6 +259,8 @@ def main():
     t0 = time.time()
     if len({arc for arc, _ in maps}) != len(maps): sys.exit('[RED] pack_ipa: mapping twice in the archive')
     es = entries(maps, {s.strip('/') for s in a.skip}, tuple(a.skip_suffix))
+    if a.verify_pulling:
+        verify_pulling(es)
     total = sum(e.st.st_size for e in es if e.st and stat.S_ISREG(e.st.st_mode))
     print(f'pack: {len(es)} entries, {total} bytes', flush=True)
     apfs = {root: fs_type(root) == b'apfs' for root in {src for _, src in maps}}

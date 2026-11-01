@@ -387,3 +387,11 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Fix:** `mtl_read_texels` encloses texture resolution, readback encoding, the GPU wait and the CPU copy in its own `@autoreleasepool`. The guest-memory path needs no Metal objects.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), measured upstream in MacNativeGames commit `635fb31` and ported in [PR #195](https://github.com/seedds/nxnative/pull/195): about 130 readbacks a second retained 3.7 GB of GPU memory after 30 minutes. Those game measurements have not been repeated here.
 - **Check:** `make -C dm/gfx/tests GAME=010015100B514000 check_t_readback` checks literal GPU and CPU readback pixels and observes the real readback buffer through a weak reference while the caller's outer pool remains open. Removing only the local pool leaves that buffer alive and fails the lifetime check.
+
+### GPU allocation owner census
+
+- **Symptom:** the process approaches its iOS memory limit while GPU allocation grows, but object counts alone cannot attribute the retained bytes.
+- **Cause:** one texture allocation can appear in several host tables and through multiple views or a placement heap. Summing object sizes would double-count shared storage. Periodic totals also miss short spikes.
+- **Diagnostic:** `memory owners` and `memory largest` snapshot the serial, sharing, retired, pool, deferred and residency tables at the existing memory-report cadence. Texture views, buffer-backed textures and heap placements resolve to one storage allocation. Per-owner totals overlap and must not be added; these are allocation sizes, not resident footprint. Snapshot references drain before returning. A sharing-only allocation is an investigation lead, not proof it can be discarded: GPU-only contents may still be needed. This does not enumerate private Metal compiler allocations or prove a complete ownership graph, and it does not change eviction behavior.
+- **Check:** `t_pso_archive` checks shared texture views and heap placements count once and that a snapshot leaves no retained texture.
+- **Found on:** [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#startup-cache-and-memory-2026-11-01); the cause of its phone exit remains open pending a same-route run with the census.

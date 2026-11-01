@@ -33,7 +33,7 @@ cheat_written = scope['cheat_written']
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
 cave_scope: dict[str, Any] = dict(struct=struct, md=md, CS_GRP_JUMP=CS_GRP_JUMP)
 exec(compile(ast.Module(body=[n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and
-                             n.name in ('dis', 'regset', 'b_target', 'bake_pi', 'bake_cave')], type_ignores=[]),
+                             n.name in ('dis', 'regset', 'b_target', 'bake_pi', 'bake_cave', 'cheat_literal')], type_ignores=[]),
              str(TOOLS / 'patch_nso.py'), 'exec'), cave_scope)
 bake_cave = cave_scope['bake_cave']
 
@@ -61,6 +61,39 @@ def bake_table(originals, rows, toggles='', data_refs=None):
         with contextlib.redirect_stdout(io.StringIO()):
             exec(compile(ast.Module(body=blocks, type_ignores=[]), str(TOOLS / 'patch_nso.py'), 'exec'), env)
     return env, patch
+
+
+class LiteralPools(unittest.TestCase):
+    def test_private_pool_leaves_original_text_unchanged(self):
+        word = 0x1C000000 | ((0x200 - 0x100) // 4 << 5)
+        env, patch = bake_table({0x100: 0xBD400000}, [('Temperature', store(0x100, word) + store(0x200, 0x461C3C00))])
+        self.assertEqual(env['CHEAT_BAKE'][0]['literals'], {0x200: 0x461C3C00})
+        self.assertEqual(set(env['CHEAT_BAKE'][0]['bodies']), {0x100})
+        self.assertEqual(env['IMG'][0x200:0x204], bytes(4))
+        self.assertIn(0x461C3C00, patch)
+
+    def test_incomplete_live_or_nonzero_pool_refuses_entire_entry(self):
+        for pool, refs, original in ((store(0x200, 7), {}, 0),
+                                     (store(0x200, 7) + store(0x204, 8), {0x204: True}, 0),
+                                     (store(0x200, 7) + store(0x204, 8), {}, 1)):
+            word = 0x5C000000 | ((0x200 - 0x100) // 4 << 5)
+            env, patch = bake_table({0x100: 0xBD400000, 0x204: original}, [('Pool', store(0x100, word) + pool)], data_refs=refs)
+            self.assertEqual(env['CHEAT_BAKE'], [])
+            self.assertEqual(patch, [])
+
+    def test_literal_loads_cannot_be_copied_without_a_verified_pool(self):
+        for word in (0x18000000, 0x58000000, 0x98000000, 0xD8000000,
+                     0x1C000000, 0x5C000000, 0x9C000000, 0xDC000000):
+            self.assertFalse(cave_scope['bake_pi']([word]))
+            env, patch = bake_table({0x100: word}, [('Replace', store(0x100, 0xD503201F))])
+            self.assertEqual(env['CHEAT_BAKE'], [])
+            self.assertEqual(patch, [])
+
+    def test_same_load_with_different_constants_is_not_an_alias(self):
+        word = 0x1C000000 | ((0x200 - 0x100) // 4 << 5)
+        env, _ = bake_table({0x100: 0xBD400000}, [(str(v), store(0x100, word) + store(0x200, v)) for v in (1, 2)])
+        self.assertEqual(len(env['CHEAT_BAKE']), 2)
+        self.assertEqual(struct.unpack_from('<I', env['IMG'], env['FLAGS_PAGE_OFF'] + 0x20 + 0x48 + 4)[0], 0)
 
 
 class SharedSites(unittest.TestCase):
@@ -123,6 +156,23 @@ class SharedSites(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'darwin' and platform.machine() == 'arm64', 'native ARM64 dispatcher execution on macOS')
 class NativeDispatch(unittest.TestCase):
+    def test_literal_pools_integer_signed_and_simd_widths(self):
+        cases = [(0x18000000, [0x89ABCDEF], 0x52800020, 0xD503201F, 0x89ABCDEF, 1),
+                 (0x58000000, [0x89ABCDEF, 0x12345678], 0x52800020, 0xD503201F, 0x1234567889ABCDEF, 1),
+                 (0x98000000, [0xFFFFFFF9], 0x52800020, 0xD503201F, 0xFFFFFFFFFFFFFFF9, 1),
+                 (0x1C000000, [0xC61C3C00], 0x1E2E1000, 0x1E260000, 0xC61C3C00, 0x3F800000),
+                 (0x1C000000, [0x461C3C00], 0x1E2E1000, 0x1E260000, 0x461C3C00, 0x3F800000),
+                 (0x5C000000, [0, 0x40C38780], 0x1E6E1000, 0x9E660000, 0x40C3878000000000, 0x3FF0000000000000),
+                 (0x9C000000, [1, 2, 3, 4], 0x4F00E400, 0x9E660000, 0x200000001, 0),
+                 (0x9C000000, [1, 2, 3, 4], 0x4F00E400, 0x4E183C00, 0x400000003, 0)]
+        for opcode, pool, original, result, on, off in cases:
+            words = store(0x100, opcode | ((0x200 - 0x100) // 4 << 5))
+            for i, value in enumerate(pool): words += store(0x200 + 4 * i, value)
+            for enabled, want in ((0, off), (1, on)):
+                with self.subTest(opcode=hex(opcode), result=hex(result), enabled=enabled):
+                    self.assertEqual(self.execute({0x100: original, 0x104: result, 0x108: B(0x108, 0x180)},
+                                                  [('Literal', words)], [enabled], nzcv=0xA0000000), (want, 0x90))
+
     def execute(self, originals, rows, states, arg=0, nzcv=0):
         # A synthetic caller preserves its ABI frame. Branch destinations record x9, NZCV and the link register
         # before returning to it; this catches flag/register clobbers as well as incorrect taken/fallthrough exits.

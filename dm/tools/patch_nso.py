@@ -94,6 +94,16 @@ for _i in range(len(_dw)):
         _dref(_i * 4 + _imm * 4)
 del _dw, _dref
 
+def cheat_literal(word, at):
+    """Integer/SIMD LDR literal and LDRSW: address and byte width; exclude PRFM and reserved forms."""
+    if word & 0x3B000000 != 0x18000000 or word >> 30 == 3: return None
+    imm = (word >> 5) & 0x7FFFF
+    if imm & 0x40000: imm -= 0x80000
+    opc = word >> 30
+    width = (4 << opc) if word & 0x04000000 else (8 if opc == 1 else 4)
+    return at + imm * 4, width
+
+
 # ---- Cheat patches (DM_CHEAT_FILE, module main only): Atmosphère-format code-write cheats baked in as toggleable patches ----
 # On iOS the sealed code pages cannot be written at run time, so a code-patch cheat cannot run from the cheat file. Instead the
 # build turns each supported "store u32 at main+off" cheat into: the site instruction becomes a branch to a patch-area stub that
@@ -248,10 +258,24 @@ if CHEAT_SRC:
         if not ok or not sites:
             print(f'    cheat "{ch["name"]}": not bakeable (only u32/u64 stores at main+off), left to the run-time engine')
             continue
-        restore = not cave and all(off + 4 <= len(IMG) and struct.unpack_from('<I', IMG, off)[0] == v for off, v in sites.items())
+        # Some tables install constants in zero words inside text, then load them with LDR literal. Keep those
+        # words out of executable patch sites and clone them beside each new load instead. Only complete pools
+        # owned by this entry, with no known original readers, qualify; existing data writes stay with the VM.
+        literals, supplied = {}, sites | cave
+        for off, word in sites.items():
+            literal = cheat_literal(word, off)
+            if literal is None: continue
+            target, width = literal
+            words = range(target, target + width, 4)
+            if all(a in supplied and 0 <= a and a + 4 <= len(IMG) and IMG[a:a + 4] == bytes(4)
+                   and a not in DATA_REFS for a in words):
+                literals.update((a, supplied[a]) for a in words)
+        for off in literals:
+            sites.pop(off, None); cave.pop(off, None)
+        restore = not cave and not literals and all(off + 4 <= len(IMG) and struct.unpack_from('<I', IMG, off)[0] == v for off, v in sites.items())
         # Runtime toggles never remove build-time variants. Every candidate retains all of its sites, including
         # shared ones; the emitted dispatcher selects the last enabled file entry at each site.
-        ch.update(mask=mask, sites=sites, cave=cave, restore=restore, has_else=has_else)
+        ch.update(mask=mask, sites=sites, cave=cave, literals=literals, restore=restore, has_else=has_else)
         if any(o in DATA_REFS or not 0 <= o < TEXT_END for o in sites):
             print(f'    cheat "{ch["name"]}": contains a data word, not baked; the run-time engine handles the whole entry')
             continue
@@ -1740,7 +1764,7 @@ if CHEAT_BAKE:
     cut_at = {c[0] for c in cuts}
     def bake_pi(words):   # words that run as-is at the stub's address: pc-relative ones (adr, adrp, ldr literal, b, bl, b.cond, cbz…) would not
         for w2 in words:
-            if w2 & 0xBF000000 == 0x18000000: return False   # ldr literal
+            if w2 & 0x3B000000 == 0x18000000: return False   # integer/SIMD literal loads and PRFM
             if w2 & 0x9F000000 in (0x10000000, 0x90000000): return False   # adr / adrp
             if w2 & 0xFC000000 == 0x94000000: return False   # bl
             try:
@@ -1779,9 +1803,17 @@ if CHEAT_BAKE:
             branches.append(at + imm * 4)
             body.append(w); at += 4
         return None                                      # a hole or no verified return: refuse the whole hook
-    def bake_instruction(w, source, dest):
+    def bake_instruction(w, source, dest, literals=None):
         """Relocate one instruction and its exits without scratch registers or changes to NZCV. Conditional
         branches use a nearby inverted test plus long B exits; BL keeps the original game's link address."""
+        literal = cheat_literal(w, source)
+        if literal is not None:
+            target, width = literal
+            if not w & 0x04000000 and w & 0x1F == 18: return None
+            if literals is None or any(a not in literals for a in range(target, target + width, 4)): return None
+            # Load an immutable private copy, then branch over it to the original continuation. No scratch
+            # register, no NZCV changes, and no write to the game's original constant-storage addresses.
+            return [(w & ~0xFFFFE0) | (2 << 5), B(dest + 4, source + 4)] + [literals[a] for a in range(target, target + width, 4)]
         target = b_target(source, w, link=True)
         if target is not None:
             if not 0 <= target < TEXT_END or target & 3: return None
@@ -1824,7 +1856,7 @@ if CHEAT_BAKE:
                 elif ch['cave'] and tgt is not None:
                     body = None  # a cave hook must not silently become a branch into uninitialized padding
                 else:
-                    body = [repl] if bake_instruction(repl, off, here()) is not None else None
+                    body = [repl] if bake_instruction(repl, off, here(), ch['literals']) is not None else None
                 if body is None: why = 'unsupported replacement or incomplete cave hook'
             if why:
                 print(f'    cheat "{ch["name"]}": site {off:#x} skipped ({why}); whole entry not baked')
@@ -1865,7 +1897,7 @@ if CHEAT_BAKE:
                 out += ch['bodies'][off]
                 out.append(B(start + len(out) * 4, off + 4))
             else:
-                relocated = bake_instruction(ch['sites'][off], off, start + len(out) * 4)
+                relocated = bake_instruction(ch['sites'][off], off, start + len(out) * 4, ch['literals'])
                 assert relocated is not None
                 out += relocated
         for word in out: emit(word)
@@ -1889,7 +1921,7 @@ if CHEAT_BAKE:
                 if not other['restore'] and c['sites'].keys() & other['sites'].keys(): reset |= 1 << j
         else:
             for j, other in enumerate(CHEAT_BAKE[:idx]):
-                if not other['restore'] and all(c[key] == other[key] for key in ('sites', 'cave', 'mask', 'has_else')):
+                if not other['restore'] and all(c[key] == other[key] for key in ('sites', 'cave', 'literals', 'mask', 'has_else')):
                     alias = j + 1; break
         kind = int(c['restore']) | (int(c['has_else']) << 1) | (alias << 8)
         struct.pack_into('<II', hdr, r, c['mask'], kind)

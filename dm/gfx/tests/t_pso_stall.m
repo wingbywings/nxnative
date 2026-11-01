@@ -157,6 +157,24 @@ int main(void) { @autoreleasepool {
     EXPECT("fixed: two pairs", 2, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
     EXPECT("fixed: built", 1, g_pre_built);
     EXPECT("fixed: no failure list", 0, [NSFileManager.defaultManager fileExistsAtPath:failp]);
+    // A completion receipt must survive additions, but not missing resources/files.
+    NSString *resources = pre_resource_stamp(), *wanted = slurp(stamp);
+    EXPECT("receipt: valid after save", 1, pre_receipt_valid(wanted, resources));
+    EXPECT("receipt: another OS/resources rejected", 0, pre_receipt_valid(wanted, @"changed"));
+    g_arch_failures = 1;
+    EXPECT("receipt: failed write not stamped", 0, pre_receipt_write(wanted, resources));
+    EXPECT("receipt: old stamp removed on failure", 0, slurp(stamp) != nil);
+    g_arch_failures = 0;
+    EXPECT("receipt: successful writes may stamp", 1, pre_receipt_write(wanted, resources));
+    NSDictionary *inventory = pre_archive_inventory();
+    NSString *first = [[inventory allKeys] firstObject];
+    unlink([arch2 stringByAppendingPathComponent:first].fileSystemRepresentation);
+    EXPECT("receipt: lost archive invalidates completion", 0, pre_receipt_valid(wanted, resources));
+    NSString *pull = [msl stringByAppendingPathComponent:@"v1_bp.metallib"];
+    unlink(pull.fileSystemRepresentation);
+    EXPECT("receipt: missing pulling library changes resources", 0, [pre_resource_stamp() isEqual:resources]);
+    g_pre_missing = 1;
+    EXPECT("receipt: missing libraries cannot complete", 0, pre_receipt_write(wanted, pre_resource_stamp()));
     [NSFileManager.defaultManager removeItemAtPath:root error:nil];
     printf("t_pso_stall: %d checks, %d failed\n", checks, failed);
     return failed != 0;

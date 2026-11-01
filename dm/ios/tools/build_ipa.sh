@@ -8,6 +8,7 @@
 #   DM_COPY_ROMFS=NO leaves the game files (RomFS) out of the IPA, as it does for the Xcode build phase: the package then stays small (a large game's full package can exceed what iOS extracts), and the app takes the files from Documents/romfs.img (scripts/push_romfs.sh); default: they are packed
 #   DM_ENTITLEMENTS=<plist> is the unsigned IPA's entitlements, signed ad-hoc into the executable (default: Increased Memory Limit; an empty string = none)
 #   AOC=add-on content directory (default $W/data/aoc; when it exists it goes to DmIOS.app/aoc/<index>/; an empty string = none), GFXAPI=nvn / vulkan (default: by the shader libraries in MSL_IOS)
+#   DM_ADHOC_SIGN=0 skips executable signing while retaining the generated entitlement requirements in dm/iCloud.entitlements.
 #   DM_CHEAT_TABLE=the game folder's cheat file for the packed build (the NSP script sets it; it goes to DmIOS.app/dm/cheats and is seeded into Documents/cheats at first launch)
 #   The app name is the game name in the base NSP's control data ($W/data/v0/control.nacp, else the one next to the RomFS), the app version is the display version in the packed game's control data (the one next to the RomFS:
 #   nx_extract saves the update's there when an update is packed, else the base game's), the bundle ID is org.nxnative.<base game title ID in lowercase> (DM_DISPLAY_NAME / DM_APP_VERSION / DM_BUNDLE_ID override them);
@@ -173,7 +174,7 @@ rm -rf "$APP/msl" "$O/Payload"   # Payload/: what the copy-and-zip packing left 
 # The entitlements of an unsigned IPA: an unsigned build has no signature for a sideloader to read them from, so the Increased Memory Limit request would be lost (AltStore and others carry over
 # the entitlements of the signature they replace; the Xcode project gets them through CODE_SIGN_ENTITLEMENTS, above). The executable gets an ad-hoc signature that carries them: the sideloader
 # replaces the signature and keeps the entitlements. Only the executable is signed: the bundle's resources are packed from elsewhere and the signature is replaced anyway
-if [ -n "${DM_ENTITLEMENTS-default}" ]; then
+if [ -n "${DM_ENTITLEMENTS-default}" ] && [ "${DM_ADHOC_SIGN:-1}" != 0 ]; then
   ENT=$O/DmIOS.entitlements
   if [ -f Gen/DmIOS.entitlements ]; then cp Gen/DmIOS.entitlements "$ENT" || die "copy generated iCloud entitlements"
   elif [ -n "${DM_ENTITLEMENTS:-}" ]; then cp "$DM_ENTITLEMENTS" "$ENT" || die "copy DM_ENTITLEMENTS"
@@ -200,11 +201,9 @@ if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
 MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
 t "pack IPA (already-compressed game files stored, everything else deflated)"
-# The pulling vertex libraries (<key>_bp, dm/gfx/tools/dmsh_pull.py) serve the hybrid pipelines. Default to the same pso_mtl4 setting compiled by gen_build.py; IOS_PULL=0 / 1 overrides it.
-# The pipeline archive's bases are made of them, so an IPA with an archive (pso/) always carries them, whatever IOS_PULL says (an Xcode build copies them always).
-PULL=$(sed -n 's/^#define DM_GAME_PSO_MTL4 //p' "$DM/host/gen/$GAME/game_profile.h") || die "read game profile header"
-case "$PULL" in 0|1) ;; *) die "no DM_GAME_PSO_MTL4 in generated game profile";; esac
-# Keep this array nonempty: macOS Bash 3.2 treats an empty array as unset under set -u.
-PACK_OPTS=(--store "$(gp zip_store)"); [ -n "${PSO:-}" ] || [ "${IOS_PULL:-$PULL}" = 1 ] || PACK_OPTS+=(--skip-suffix _bp.metallib)
+# Metal 4 is a runtime launcher choice, even for profiles whose default is off.
+# Include and validate its pulling libraries for every NVN IPA. IOS_PULL=0 used to
+# strip them and silently break that choice; keep the resources regardless of it.
+PACK_OPTS=(--store "$(gp zip_store)" --verify-pulling)
 python3 tools/pack_ipa.py "$OUT_IPA" "${PACK_OPTS[@]}" --skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs --skip $P/romfs.img --skip $P/romfs.id "${MAPS[@]}" || die "pack_ipa"
 t "done: $OUT_IPA ($(du -h "$OUT_IPA" | cut -f1))"
