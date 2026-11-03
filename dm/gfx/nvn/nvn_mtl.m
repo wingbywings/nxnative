@@ -93,6 +93,56 @@ static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX]; static int g_alloc_n, g_all
 static id<MTL4CommandAllocator> g_up_alloc4[3];
 static id<MTL4CommandAllocator> g_present_alloc4[3];
 static id<MTL4CommandBuffer> g_present_cb[3];
+// Only the allocator's encoding owner samples/replaces it, after its GPU work has
+// finished. Diagnostics on another thread read these atomic snapshots, not Metal.
+typedef struct {
+    uint64_t checked_at, replaced_at;
+    _Atomic uint64_t bytes, peak, retired_bytes, replacements, failures;
+} NvAllocMemory;
+static NvAllocMemory g_alloc_mem[ALLOC_MAX], g_up_alloc_mem[3], g_present_alloc_mem[3];
+#define ALLOC_TRIM_BYTES (64ull << 20)
+#define ALLOC_TRIM_HEADROOM (1536ull << 20)
+#define ALLOC_TRIM_INTERVAL (10ull * NSEC_PER_SEC)
+// reset permits reuse of the high-water allocation; it does not shrink it. Retire
+// an oversized allocator under pressure, never live commands or game resources.
+// The old allocator remains usable if creating its replacement fails.
+static id<MTL4CommandAllocator> alloc_recycle(id<MTL4CommandAllocator> a, NvAllocMemory *s,
+                                             uint64_t now, uint64_t headroom, int enabled) { @autoreleasepool {
+    uint64_t bytes = a.allocatedSize;
+    atomic_store(&s->bytes, bytes);
+    if (bytes > atomic_load(&s->peak)) atomic_store(&s->peak, bytes);
+    if (enabled && bytes > ALLOC_TRIM_BYTES && headroom < ALLOC_TRIM_HEADROOM &&
+        (!s->replaced_at || now - s->replaced_at >= ALLOC_TRIM_INTERVAL)) {
+        // Rate-limit failed attempts too; pressure must not trigger an allocation
+        // attempt on every submission when the device cannot make a replacement.
+        s->replaced_at = now;
+        MTL4CommandAllocatorDescriptor *d = [MTL4CommandAllocatorDescriptor new]; d.label = a.label;
+        id<MTL4CommandAllocator> fresh = [g_dev newCommandAllocatorWithDescriptor:d error:nil];
+        if (fresh) {
+            atomic_fetch_add(&s->retired_bytes, bytes); atomic_fetch_add(&s->replacements, 1);
+            atomic_store(&s->bytes, fresh.allocatedSize);
+            return fresh;
+        }
+        atomic_fetch_add(&s->failures, 1);
+    }
+    [a reset];
+    return a;
+} }
+static id<MTL4CommandAllocator> alloc_reset(id<MTL4CommandAllocator> a, NvAllocMemory *s) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (s->checked_at && now - s->checked_at < NSEC_PER_SEC) { [a reset]; return a; }
+    s->checked_at = now;
+    static int mode; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_ALLOC_TRIM"); mode = e ? (atoi(e) ? 1 : -1) : 0; });
+    uint64_t headroom = UINT64_MAX;
+#if TARGET_OS_IPHONE
+    headroom = os_proc_available_memory();
+#endif
+    // 1 forces the pressure condition for isolated Mac tests / A-B measurements;
+    // 0 disables retirement. Unset uses the current iOS allowance, not a fixed cap.
+    if (mode == 1) headroom = 0;
+    return alloc_recycle(a, s, now, headroom, mode != -1);
+}
 static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct;
 static int g_vbuf_cache = 1;   // DM_NVN_VBUF_CACHE=0 restores the uncached path for A/B measurements
 static uint64_t g_vt_addr[31]; static uint32_t g_vt_valid;
@@ -204,6 +254,9 @@ static void ws_report(uint64_t frame, uint64_t frames) {
 }
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
+// Weak diagnostics only: allocations removed from residency but still alive elsewhere.
+// Access under g_res_mu, inside an autorelease pool (as for g_res_objects).
+static NSHashTable *g_removed_objects;
 static _Atomic unsigned g_image_heap_n;
 static inline MTL4VisibilityOptions resource_vis(void) { return MTL4VisibilityOptionDevice | (g_image_heap_n ? MTL4VisibilityOptionResourceAlias : 0); }
 // Residency churn by call site (the power line every 300 frames, mtl_res_stats): each commit with changes is a kernel call whose cost grows with what was added or removed
@@ -217,6 +270,7 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
     id<MTLAllocation> r = [(id)allocation conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)allocation).heap ? (id)((id<MTLResource>)allocation).heap : allocation;
     pthread_mutex_lock(&g_res_mu);
     if (!g_res_objects) g_res_objects = [NSHashTable weakObjectsHashTable];
+    [g_removed_objects removeObject:r];
     if ([g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }   // already resident (a shared texture resolved again): marking the set dirty would cost a commit that changes nothing
     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
     [g_res addAllocation:(id<MTLAllocation>)r];
@@ -229,6 +283,8 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
     if ([(id)r conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)r).heap) return;
     pthread_mutex_lock(&g_res_mu);
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
+    if (!g_removed_objects) g_removed_objects = [NSHashTable weakObjectsHashTable];
+    [g_removed_objects addObject:r];
     [g_res removeAllocation:(id<MTLAllocation>)r];
     [g_res_objects removeObject:r];
     g_res_dirty = 1; g_rs_rm++;
@@ -804,7 +860,7 @@ void mtl_sub_begin(void) {
         alloc_i = g_alloc_n++; g_alloc_grown++; }
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
     g_alloc_cur = alloc_i;
-    [g_alloc4[alloc_i] reset];
+    g_alloc4[alloc_i] = alloc_reset(g_alloc4[alloc_i], &g_alloc_mem[alloc_i]);
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
     g_commit_blocks = [NSMutableArray array];
     // The overflow buffer created when the previous submission ran out of slots (see g_vis_n >= VIS_SLOTS): retire it. It used to be just cleared here and stayed in the residency set for good (from d2r-mobile 2eb575877)
@@ -1460,7 +1516,11 @@ static int post_claim(post_rec *r, uint64_t fence) {
     if (r->fence != fence || r->claimed) { pthread_mutex_unlock(&g_post_mu); return 0; }
     return 1;
 }
-static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
+// Fast SyncWait may land readbacks on a long-lived guest thread, outside the
+// submission pool. MTLBuffer.contents is NS_RETURNS_INNER_POINTER: ARC inserts
+// retain/autorelease to keep the pointer's buffer alive. Scope those references
+// to completion, or retired readback buffers survive for the guest thread's life.
+static void post_run(post_rec *r, uint64_t c0, uint64_t c1) { @autoreleasepool {
     int n = r->n; post_op *ops = r->ops; seg_clk *sc = r->sc; uint32_t seg_last = r->seg_last;
     for (int i = 0; i < n; i++) {
         if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
@@ -1475,7 +1535,7 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
     free(ops); seg_clk_put(sc); r->ops = NULL; r->sc = NULL;
     atomic_store(&r->claimed, 1);
     pthread_mutex_unlock(&g_post_mu);
-}
+} }
 // Both GPU feedback and an early waiter complete records in submission order.
 // Delayed callbacks carry their fence, never the identity of a recyclable slot.
 static void post_complete(uint64_t fence, uint64_t c0, uint64_t c1) {
@@ -2098,7 +2158,7 @@ static void up_begin(void) {
     up_wait_zero(&g_up_alloc_busy[slot], WS_UPALLOC);
     atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot;
     g_up_batch_bytes = 0; g_up_over_used = 0;
-    [g_up_alloc4[slot] reset];
+    g_up_alloc4[slot] = alloc_reset(g_up_alloc4[slot], &g_up_alloc_mem[slot]);
     g_up_cb = [g_dev newCommandBuffer];
     [g_up_cb beginCommandBufferWithAllocator:g_up_alloc4[slot]];
     g_up_ce = [g_up_cb computeCommandEncoder];
@@ -2731,7 +2791,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
 // Snapshot retained GPU allocations with owner bits. A view, its parent, a buffer
 // texture and a placement texture all resolve to their storage allocation owner.
 // Sizes describe allocations, not process footprint (shared guest pages overlap).
-enum { MEM_SERIAL = 1, MEM_SHARED = 2, MEM_RETIRED = 4, MEM_POOL = 8, MEM_DEFERRED = 16, MEM_RESIDENT = 32 };
+enum { MEM_SERIAL = 1, MEM_SHARED = 2, MEM_RETIRED = 4, MEM_POOL = 8, MEM_DEFERRED = 16, MEM_RESIDENT = 32, MEM_VIEW = 64, MEM_REMOVED = 128, MEM_OWNER_N = 8 };
 static id mem_allocation(id o) {
     if ([o conformsToProtocol:@protocol(MTLTexture)]) {
         id<MTLTexture> t = o;
@@ -2751,6 +2811,13 @@ static void mem_owner(NSMapTable *map, id o, unsigned owner) {
 static uint64_t mem_bytes(id o) {
     return [o conformsToProtocol:@protocol(MTLHeap)] ? ((id<MTLHeap>)o).size : ((id<MTLResource>)o).allocatedSize;
 }
+static void mem_view_owners(NSMapTable *map);
+static void mem_res_owners(NSMapTable *map) {
+    pthread_mutex_lock(&g_res_mu);
+    for (id o in g_res_objects) mem_owner(map, o, MEM_RESIDENT);
+    for (id o in g_removed_objects) mem_owner(map, o, MEM_REMOVED);
+    pthread_mutex_unlock(&g_res_mu);
+}
 static void mem_census(uint64_t frame) { @autoreleasepool {
     NSMapTable *map = [NSMapTable strongToStrongObjectsMapTable];
     pthread_mutex_lock(&g_smu);
@@ -2760,12 +2827,14 @@ static void mem_census(uint64_t frame) { @autoreleasepool {
     pthread_mutex_unlock(&g_smu);
     pthread_mutex_lock(&g_mu); for (id o in g_keep) mem_owner(map, o, MEM_POOL); pthread_mutex_unlock(&g_mu);
     pthread_mutex_lock(&g_deferred_mu); for (NvDeferredRelease *d in g_deferred) mem_owner(map, d->object, MEM_DEFERRED); pthread_mutex_unlock(&g_deferred_mu);
-    pthread_mutex_lock(&g_res_mu); for (id o in g_res_objects) mem_owner(map, o, MEM_RESIDENT); pthread_mutex_unlock(&g_res_mu);
-    uint64_t bytes[6] = {0}, total = 0, shared_only = 0; unsigned counts[6] = {0};
+    mem_res_owners(map);
+    mem_view_owners(map);
+    uint64_t bytes[MEM_OWNER_N] = {0}, total = 0, shared_only = 0, removed_only = 0; unsigned counts[MEM_OWNER_N] = {0};
     id top[4] = {nil, nil, nil, nil}; uint64_t sizes[4] = {0};
     for (id o in map) {
         unsigned owner = [[map objectForKey:o] unsignedIntValue]; uint64_t n = mem_bytes(o); total += n;
-        for (unsigned j = 0; j < 6; j++) if (owner & (1u << j)) { bytes[j] += n; counts[j]++; }
+        for (unsigned j = 0; j < MEM_OWNER_N; j++) if (owner & (1u << j)) { bytes[j] += n; counts[j]++; }
+        if (owner == MEM_REMOVED) removed_only += n;
         if ((owner & MEM_SHARED) && !(owner & (MEM_SERIAL | MEM_RETIRED | MEM_POOL | MEM_DEFERRED))) shared_only += n;
         for (int i = 0; i < 4; i++) if (n > sizes[i]) { for (int j = 3; j > i; j--) { sizes[j] = sizes[j-1]; top[j] = top[j-1]; } sizes[i] = n; top[i] = o; break; }
     }
@@ -2773,13 +2842,32 @@ static void mem_census(uint64_t frame) { @autoreleasepool {
         (unsigned long long)frame, (unsigned long)map.count, (unsigned long long)(total >> 20),
         counts[0], (unsigned long long)(bytes[0] >> 20), counts[1], (unsigned long long)(bytes[1] >> 20), counts[2], (unsigned long long)(bytes[2] >> 20),
         counts[3], (unsigned long long)(bytes[3] >> 20), counts[4], (unsigned long long)(bytes[4] >> 20), counts[5], (unsigned long long)(bytes[5] >> 20), (unsigned long long)(shared_only >> 20));
+    MLOG("memory additional owners: view caches %u/%llu MiB, removed from residency but alive %u/%llu MiB (%llu MiB without another tracked owner); overlap included in unique total, not footprint",
+        counts[6], (unsigned long long)(bytes[6] >> 20), counts[7], (unsigned long long)(bytes[7] >> 20), (unsigned long long)(removed_only >> 20));
     for (unsigned i = 0; i < 4 && top[i]; i++) {
         id o = top[i]; id<MTLTexture> t = [o conformsToProtocol:@protocol(MTLTexture)] ? o : nil;
         MLOG("memory largest %u: %llu MiB, owners %#x, %s %lux%lux%lu format %lu", i + 1, (unsigned long long)(sizes[i] >> 20), [[map objectForKey:o] unsignedIntValue],
             t ? "texture" : [o conformsToProtocol:@protocol(MTLHeap)] ? "heap" : "buffer", (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, (unsigned long)t.pixelFormat);
     }
 } }
-// Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
+static void pso_mem_stat(void);
+static void alloc_mem_stat(void) {
+    NvAllocMemory *groups[] = {g_alloc_mem, g_up_alloc_mem, g_present_alloc_mem};
+    unsigned lengths[] = {ALLOC_MAX, 3, 3};
+    uint64_t bytes[3] = {0}, largest = 0, retired = 0, replacements = 0, failures = 0;
+    for (unsigned g = 0; g < 3; g++) for (unsigned i = 0; i < lengths[g]; i++) {
+        NvAllocMemory *s = &groups[g][i]; bytes[g] += atomic_load(&s->bytes);
+        largest = MAX(largest, atomic_load(&s->peak)); retired += atomic_load(&s->retired_bytes);
+        replacements += atomic_load(&s->replacements); failures += atomic_load(&s->failures);
+    }
+    task_vm_info_data_t vi = {0}; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    int valid = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS && n >= TASK_VM_INFO_REV3_COUNT;
+    MLOG("memory allocators: sampled capacity main %llu / upload %llu / present %llu MiB; largest observed allocator %llu MiB; replacements %llu, retired capacity %llu MiB (cumulative, not footprint saved), failures %llu; process peak footprint %lld MiB",
+        (unsigned long long)(bytes[0] >> 20), (unsigned long long)(bytes[1] >> 20), (unsigned long long)(bytes[2] >> 20),
+        (unsigned long long)(largest >> 20), (unsigned long long)replacements, (unsigned long long)(retired >> 20),
+        (unsigned long long)failures, valid ? (long long)(vi.ledger_phys_footprint_peak >> 20) : -1ll);
+}
+// Memory readout (always on, low frequency, capped): footprint, allocations and owners.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
@@ -2789,6 +2877,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     // A bounded snapshot at the existing low-frequency report cadence. Release all
     // snapshot references before returning; never turn diagnostics into a resource owner.
     mem_census(frame);
+    alloc_mem_stat();
+    pso_mem_stat();
     pthread_mutex_lock(&g_deferred_mu); unsigned long nd = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
     pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
@@ -2814,9 +2904,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
            "(tbuf_as_2d); texture type mismatches no view bridges %llu in total (tex_mis_note)",
            vn, (unsigned long long)vh, (unsigned long long)vm, (unsigned long long)tb, (unsigned long long)tm, (unsigned long long)tf, (unsigned long long)tc, (unsigned long long)(tcb >> 20), (unsigned long long)mtl_tex_mis_count()); }
-    if (g_allocprof > 0) { char ab[256]; int o = 0; for (int i = 0; i < g_alloc_n && o < 200; i++) o += snprintf(ab + o, sizeof ab - o, " #%d %llu MB", i, (unsigned long long)(g_alloc4[i].allocatedSize >> 20));
-        for (int i = 0; i < 3 && o < 240; i++) o += snprintf(ab + o, sizeof ab - o, " up%d %llu pres%d %llu", i, (unsigned long long)(g_up_alloc4[i].allocatedSize >> 20), i, (unsigned long long)(g_present_alloc4[i].allocatedSize >> 20));
-        MLOG("command allocator usage:%s", ab);
+    if (g_allocprof > 0) {
         MLOG("GPU allocation growth by function: pass end %llu MB, pass begin %llu MB, pipeline fetch %llu MB, argument buffers %llu MB, texture fetch %llu MB", g_ap_fn[0] >> 20, g_ap_fn[1] >> 20, g_ap_fn[2] >> 20, g_ap_fn[3] >> 20, g_ap_fn[4] >> 20); }
     if (g_allocprof > 0) { int top[4] = {-1, -1, -1, -1}; for (int o = 0; o < 64; o++) for (int k = 0; k < 4; k++) if (top[k] < 0 || g_ap_bytes[o] > g_ap_bytes[top[k]]) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = o; break; }
         MLOG("GPU allocation growth by op: op%d %llu MB, op%d %llu MB, op%d %llu MB, op%d %llu MB", top[0], g_ap_bytes[top[0]] >> 20, top[1], g_ap_bytes[top[1]] >> 20, top[2], g_ap_bytes[top[2]] >> 20, top[3], g_ap_bytes[top[3]] >> 20); }
@@ -4246,6 +4334,21 @@ static void vc_put(uint64_t ser, const void *pool, const vc_key *k, id<MTLTextur
 }
 void mtl_vc_drop(uint64_t ser) { os_unfair_lock_lock(&g_rmu); vc_set *s = nvn_hm_del(&g_vc, &ser); if (s) vc_set_free(s); os_unfair_lock_unlock(&g_rmu); }
 void mtl_vc_stats(unsigned *n, uint64_t *hit, uint64_t *made) { os_unfair_lock_lock(&g_rmu); *n = g_vc.n; *hit = g_vc_hit; *made = g_vc_new; os_unfair_lock_unlock(&g_rmu); }
+static void mem_view_owners(NSMapTable *map) {
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < g_ntreg; i++) {
+        treg_t *r = &g_treg[i];
+        mem_owner(map, (__bridge id)r->view, MEM_VIEW);
+        mem_owner(map, (__bridge id)r->alt, MEM_VIEW);
+        mem_owner(map, (__bridge id)r->im, MEM_VIEW);
+    }
+    for (uint32_t i = 0; i < g_vc.cap; i++) if (g_vc.vals[i]) {
+        vc_set *s = g_vc.vals[i];
+        for (unsigned j = 0; j < VC_WAYS; j++) mem_owner(map, (__bridge id)s->view[j], MEM_VIEW);
+        mem_owner(map, (__bridge id)s->rows, MEM_VIEW);
+    }
+    os_unfair_lock_unlock(&g_rmu);
+}
 static void vc_drop_pool(const void *pool) {   // caller holds g_rmu
     for (uint32_t i = 0; i < g_vc.cap;) {   // a deletion shifts later entries back into slot i: look at it again
         vc_set *s = g_vc.vals[i];
@@ -10011,6 +10114,14 @@ static void warm_claim(void) {
         }
     }
 }
+// Called on the submit thread, which owns shader/final-pipeline caches. Base and
+// warm-up caches are shared with workers and are counted under their own locks.
+static void pso_mem_stat(void) {
+    os_unfair_lock_lock(&g_pbase_lock); unsigned bases = g_pbase.n, pending = g_pbase_pending.n; os_unfair_lock_unlock(&g_pbase_lock);
+    os_unfair_lock_lock(&g_warm_lock); unsigned long warm = g_warm_items.count; os_unfair_lock_unlock(&g_warm_lock);
+    MLOG("memory pipeline objects: shaders %lu, render %u, compute %u, hybrid %u, bases %u, base jobs %u, unclaimed warm-up %lu; archives %lu (counts, not allocation bytes)",
+        (unsigned long)g_shcache.count, g_pso.n, g_cps.n, g_pso_hy.n, bases, pending, warm, (unsigned long)(g_arch4.count + g_arch4p.count));
+}
 // Dispatches share the open copy encoder (a Metal 4 compute encoder) with the copies and dispatches around them, each ordered after everything the encoder already holds by a barrier inside it,
 // as a texture copy is (blit). An encoder of their own, with full queue barriers on both sides, cost the GPU a drain per dispatch: Hyrule Warriors: Age of Calamity's battles after the first cutscene
 // run about 1,060 small dispatches a frame, and the Mac GPU went from 6.7 to 16 ms a frame at the same draws, the iPhone's from 15 to about 50 (17 fps).
@@ -11638,7 +11749,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         while (g_present_alloc_done[alloc_i] < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         pthread_mutex_unlock(&g_pq_mu);
     }
-    [g_present_alloc4[alloc_i] reset];
+    g_present_alloc4[alloc_i] = alloc_reset(g_present_alloc4[alloc_i], &g_present_alloc_mem[alloc_i]);
     [g_q4 waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];

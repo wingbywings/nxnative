@@ -92,6 +92,12 @@ t_fuse_check: t_fuse_check.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_fuse_check.m $(MTL_T_SRC) $(FW)
 t_perf_order: t_perf_order.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_perf_order.m $(MTL_T_SRC) $(FW)
+t_post_memory: t_post_memory.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_post_memory.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_post_memory
+check_t_post_memory: t_post_memory
+	DM_NVN_FAST_WAKE=1 DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_post_memory
+	DM_NVN_FAST_WAKE=1 DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_post_memory
 t_perf_order_tsan: t_perf_order.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -fsanitize=thread -o $@ t_perf_order.m $(MTL_T_SRC) $(FW)
 .PHONY: perf-order-cpu
@@ -302,6 +308,15 @@ t_view_levels: t_view_levels.m $(MTL_T_DEP)
 check_t_view_levels: RUN_ENV = MTL_DEBUG_LAYER=1
 t_upload_budget: t_upload_budget.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_budget.m $(MTL_T_SRC) $(FW)
+t_alloc_memory: t_alloc_memory.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_alloc_memory.m $(MTL_T_SRC) $(FW)
+t_resource_memory: t_resource_memory.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_resource_memory.m $(MTL_T_SRC) $(FW)
+check_t_resource_memory: RUN_ENV = MTL_DEBUG_LAYER=1
+check_t_alloc_memory: t_alloc_memory
+	MTL_DEBUG_LAYER=1 ./t_alloc_memory
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_alloc_memory
+.PHONY: check_t_alloc_memory
 check_t_upload_budget: t_upload_budget
 	MTL_DEBUG_LAYER=1 ./t_upload_budget
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_upload_budget

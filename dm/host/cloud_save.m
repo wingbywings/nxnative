@@ -24,22 +24,24 @@ static BOOL waiting(NSError **error, NSString *message) {
 }
 static NSURL *child(NSURL *root, NSString *name) { return [root URLByAppendingPathComponent:name]; }
 // A remote document may have no local filesystem entry yet. Run the metadata
-// query on the main run loop while the explicit restore worker waits for it.
-static BOOL discoverBackup(NSURL *marker, NSError **error) {
-    if (NSThread.isMainThread) return fail(error, @"Backup discovery must run off the main thread.");
+// query on the main run loop while the explicit transfer worker waits for it.
+static NSArray<NSURL *> *discoverCloudItems(NSURL *folder, NSError **error) {
+    if (NSThread.isMainThread) { fail(error, @"Backup discovery must run off the main thread."); return nil; }
     dispatch_semaphore_t finished = dispatch_semaphore_create(0);
     __block NSMetadataQuery *query;
     __block id observer;
-    __block BOOL gathered = NO, found = NO;
+    __block BOOL gathered = NO;
+    NSMutableArray<NSURL *> *items = [NSMutableArray array];
+    NSString *prefix = [folder.URLByStandardizingPath.path stringByAppendingString:@"/"];
     dispatch_sync(dispatch_get_main_queue(), ^{
         query = [NSMetadataQuery new];
         query.searchScopes = @[NSMetadataQueryUbiquitousDocumentsScope];
-        query.predicate = [NSPredicate predicateWithFormat:@"%K == %@", NSMetadataItemFSNameKey, marker.lastPathComponent];
+        query.predicate = [NSPredicate predicateWithFormat:@"%K LIKE '*'", NSMetadataItemFSNameKey];
         observer = [NSNotificationCenter.defaultCenter addObserverForName:NSMetadataQueryDidFinishGatheringNotification object:query queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
             (void)note; gathered = YES;
             for (NSMetadataItem *item in query.results) {
                 NSURL *url = [item valueForAttribute:NSMetadataItemURLKey];
-                if ([url.URLByStandardizingPath.path isEqual:marker.URLByStandardizingPath.path]) { found = YES; break; }
+                if ([url.URLByStandardizingPath.path hasPrefix:prefix]) [items addObject:url];
             }
             dispatch_semaphore_signal(finished);
         }];
@@ -49,9 +51,72 @@ static BOOL discoverBackup(NSURL *marker, NSError **error) {
     dispatch_sync(dispatch_get_main_queue(), ^{
         [query stopQuery]; [NSNotificationCenter.defaultCenter removeObserver:observer];
     });
-    if (found) return YES;
-    return fail(error, gathered ? @"No completed backup for this game is available in iCloud on this device. On the device with your saves, use Back up to iCloud first. Older backups need to be backed up again with this version. Local files were not changed." : @"iCloud backup discovery has not completed. Check iCloud Drive access and retry Restore. Local files were not changed.");
+    if (gathered) return items;
+    fail(error, @"iCloud backup discovery did not complete. Check iCloud Drive access and try again. No backup or restore was performed.");
+    return nil;
 }
+
+// Downloads are asynchronous, including refreshes of already cached files. Ask
+// for every item before waiting, and use fresh resource values until all files
+// are Current. A directory request alone does not verify each descendant.
+@interface DMCloudDownloader : NSObject
+- (NSArray<NSURL *> *)discoverItems:(NSURL *)folder error:(NSError **)error;
+- (BOOL)downloadDirectory:(NSURL *)folder error:(NSError **)error;
+- (BOOL)requestDownload:(NSURL *)url error:(NSError **)error;
+- (BOOL)itemIsCurrent:(NSURL *)url error:(NSError **)error;
+- (BOOL)downloadItems:(NSArray<NSURL *> *)items timeout:(NSTimeInterval)timeout error:(NSError **)error;
+@end
+@implementation DMCloudDownloader
+- (NSArray<NSURL *> *)discoverItems:(NSURL *)folder error:(NSError **)error {
+    return discoverCloudItems(folder, error);
+}
+- (BOOL)downloadDirectory:(NSURL *)folder error:(NSError **)error {
+    NSArray<NSURL *> *discovered = [self discoverItems:folder error:error];
+    if (!discovered) return NO;
+    NSMutableOrderedSet<NSURL *> *items = [NSMutableOrderedSet orderedSetWithArray:discovered];
+    // No cloud directory is expected for the first backup. Do not create it
+    // until discovery has completed successfully, even when nothing is cached.
+    if (items.count || [NSFileManager.defaultManager fileExistsAtPath:folder.path]) [items insertObject:folder atIndex:0];
+    return [self downloadItems:items.array timeout:120 error:error];
+}
+- (BOOL)requestDownload:(NSURL *)url error:(NSError **)error {
+    return [NSFileManager.defaultManager startDownloadingUbiquitousItemAtURL:url error:error];
+}
+- (BOOL)itemIsCurrent:(NSURL *)url error:(NSError **)error {
+    url = [NSURL fileURLWithPath:url.path];
+    NSNumber *ubiquitous, *directory, *conflict; NSString *status; NSError *transfer;
+    if (![url getResourceValue:&ubiquitous forKey:NSURLIsUbiquitousItemKey error:error]) return NO;
+    if (!ubiquitous.boolValue) return fail(error, @"An iCloud backup item is unavailable. No backup or restore was performed.");
+    if (![url getResourceValue:&conflict forKey:NSURLUbiquitousItemHasUnresolvedConflictsKey error:error] ||
+        ![url getResourceValue:&transfer forKey:NSURLUbiquitousItemDownloadingErrorKey error:error] ||
+        ![url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:error]) return NO;
+    if (conflict.boolValue || [NSFileVersion unresolvedConflictVersionsOfItemAtURL:url].count)
+        return fail(error, @"iCloud has conflicting saves. Resolve the conflict in Files; no version was overwritten.");
+    if (transfer) { if (error) *error = transfer; return NO; }
+    // Directories have no file download status; their files are checked separately.
+    if (directory.boolValue) return YES;
+    if (![url getResourceValue:&status forKey:NSURLUbiquitousItemDownloadingStatusKey error:error]) return NO;
+    return [status isEqual:NSURLUbiquitousItemDownloadingStatusCurrent];
+}
+- (BOOL)downloadItems:(NSArray<NSURL *> *)items timeout:(NSTimeInterval)timeout error:(NSError **)error {
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + timeout;
+    for (NSURL *url in items) if (![self requestDownload:url error:error]) return NO;
+    NSMutableArray<NSURL *> *pending = [items mutableCopy];
+    while (pending.count) {
+        for (NSURL *url in [pending copy]) {
+            NSError *itemError = nil;
+            if ([self itemIsCurrent:url error:&itemError]) [pending removeObject:url];
+            else if (itemError) { if (error) *error = itemError; return NO; }
+        }
+        if (!pending.count) return YES;
+        NSTimeInterval remaining = deadline - NSProcessInfo.processInfo.systemUptime;
+        if (remaining <= 0) return fail(error, @"Downloading the latest iCloud backup timed out. Check your connection and try again. No backup or restore was performed.");
+        // Poll actual transfer state on the worker, never delay or block the UI.
+        [NSThread sleepForTimeInterval:MIN(0.2, remaining)];
+    }
+    return YES;
+}
+@end
 static BOOL writePlist(id object, NSURL *url, NSError **error) {
     NSData *data = [NSPropertyListSerialization dataWithPropertyList:object format:NSPropertyListBinaryFormat_v1_0 options:0 error:error];
     return data && [data writeToURL:url options:NSDataWritingAtomic error:error];
@@ -187,8 +252,11 @@ static BOOL restore(NSDictionary *s, NSURL *local, NSError **error) {
         return fail(error, @"iCloud has conflicting saves. Resolve the conflict in Files before playing; no version was overwritten.");
     if (transfer) { if (error) *error = transfer; return NO; }
     if (![status isEqual:NSURLUbiquitousItemDownloadingStatusCurrent]) {
-        [NSFileManager.defaultManager startDownloadingUbiquitousItemAtURL:url error:NULL];
-        return waiting(error, @"Waiting for the latest iCloud save to download. Keep the app open and retry.");
+        // The directory preflight waits before taking coordination locks. A
+        // later cloud change must abort: waiting inside a coordinated write
+        // would prevent iCloud from installing the download we are waiting for.
+        if (![NSFileManager.defaultManager startDownloadingUbiquitousItemAtURL:url error:error]) return NO;
+        return waiting(error, @"The iCloud backup changed during this transfer. Try again after the other device finishes its backup.");
     }
     if (uploaded) {
         if (![url getResourceValue:&sent forKey:NSURLUbiquitousItemIsUploadedKey error:error] ||
@@ -434,12 +502,15 @@ static BOOL transfer(BOOL downloading, NSError **error) {
     NSArray *names = backupNames();
     NSArray *locals = @[child(documents, @"save"), child(documents, @"cheats")];
     NSURL *game = child(child(container, @"Documents"), @DM_GAME_ID), *metadata = child(game, @"nxnative-backup");
+    // Both directions need current cloud contents before reading revisions or
+    // replacing a directory. This also discovers files not yet on this device.
+    if (![[DMCloudDownloader new] downloadDirectory:game error:error]) return NO;
     if (!downloading && ![fm createDirectoryAtURL:metadata withIntermediateDirectories:YES attributes:nil error:error]) return NO;
     NSMutableArray *snapshots = [NSMutableArray array];
     NSURL *marker = child(metadata, @"backup.plist");
     NSDictionary *generation;
     if (downloading) {
-        if (!discoverBackup(marker, error)) return NO;
+        if (![fm fileExistsAtPath:marker.path]) return fail(error, @"No completed backup for this game is available in iCloud. On the device with your saves, use Back up to iCloud first. Local files were not changed.");
         DMCloudSaveStore *probe = [[DMCloudSaveStore alloc] initWithFolder:metadata local:locals[0] title:@"save"];
         if (![probe checkCloud:marker uploaded:NO error:error]) return NO;
         generation = readPlist(marker, error);

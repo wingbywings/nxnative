@@ -22,12 +22,78 @@ static void put(NSURL *root, NSString *name, NSString *value) {
 }
 static NSString *get(NSURL *root, NSString *name) { return [NSString stringWithContentsOfURL:child(root, name) encoding:NSUTF8StringEncoding error:NULL]; }
 static LocalCloud *device(NSURL *cloud, NSURL *local) { return [[LocalCloud alloc] initWithFolder:cloud local:local title:@"010015100B514000"]; }
+
+// Simulate asynchronous iCloud downloads, including files with no local entry.
+// Keep the production discovery/download ordering, wait loop and error handling.
+@interface DownloadCloud : DMCloudDownloader
+@property NSArray<NSURL *> *discovered;
+@property NSMutableArray<NSURL *> *requested;
+@property NSMutableDictionary<NSURL *, NSNumber *> *checks;
+@property NSURL *requestFailure;
+@property NSURL *transferFailure;
+@property BOOL stalled;
+@property BOOL discoveryFailure;
+@property NSUInteger expectedRequests;
+@end
+@implementation DownloadCloud
+- (instancetype)init {
+    if ((self = [super init])) { _requested = [NSMutableArray array]; _checks = [NSMutableDictionary dictionary]; _discovered = @[]; }
+    return self;
+}
+- (NSArray<NSURL *> *)discoverItems:(NSURL *)folder error:(NSError **)error {
+    (void)folder;
+    if (self.discoveryFailure) { fail(error, @"Injected discovery failure"); return nil; }
+    return self.discovered;
+}
+- (BOOL)requestDownload:(NSURL *)url error:(NSError **)error {
+    [self.requested addObject:url];
+    return [url isEqual:self.requestFailure] ? fail(error, @"Injected download request failure") : YES;
+}
+- (BOOL)itemIsCurrent:(NSURL *)url error:(NSError **)error {
+    CHECK(self.requested.count == self.expectedRequests, "request every cloud item before waiting for any of them");
+    if ([url isEqual:self.transferFailure]) return fail(error, @"Injected asynchronous download failure");
+    NSUInteger count = [self.checks[url] unsignedIntegerValue] + 1;
+    self.checks[url] = @(count);
+    return !self.stalled && (count > 1 || [url.lastPathComponent isEqual:@"cached"]);
+}
+@end
+
+static void testDownloads(NSURL *root) {
+    NSURL *folder = child(root, @"remote-only-game");
+    NSArray *files = @[child(folder, @"save/nested/progress"), child(folder, @"cheats/toggles.txt"),
+        child(folder, @"nxnative-backup/backup.plist"), child(folder, @"cached")];
+    DownloadCloud *cloud = [DownloadCloud new];
+    cloud.discovered = files; cloud.expectedRequests = files.count + 1;
+    NSError *error = nil;
+    CHECK([cloud downloadDirectory:folder error:&error], "automatically finish directory download without asking the user to retry");
+    CHECK([cloud.requested.firstObject isEqual:folder], "refresh the game directory before its descendants");
+    CHECK([cloud.requested containsObject:files.lastObject], "refresh cached Current files too");
+    CHECK([cloud.checks[files[0]] unsignedIntegerValue] == 2 && [cloud.checks[files[2]] unsignedIntegerValue] == 2,
+        "wait for both nested save data and completion metadata");
+    CHECK(![NSFileManager.defaultManager fileExistsAtPath:folder.path], "preflight does not create or replace backup directories");
+
+    cloud = [DownloadCloud new];
+    CHECK([cloud downloadDirectory:folder error:&error] && !cloud.requested.count, "first backup allows a successfully discovered empty cloud folder");
+    cloud.discoveryFailure = YES; error = nil;
+    CHECK(![cloud downloadDirectory:folder error:&error] && error && !cloud.requested.count, "discovery failure cannot be mistaken for an empty first backup");
+
+    cloud = [DownloadCloud new]; cloud.expectedRequests = files.count; cloud.requestFailure = files[1]; error = nil;
+    CHECK(![cloud downloadItems:files timeout:1 error:&error] && [error.localizedDescription containsString:@"request failure"] && !cloud.checks.count,
+        "surface failure to start a download before reading any cloud files");
+    cloud = [DownloadCloud new]; cloud.expectedRequests = files.count; cloud.transferFailure = files[1]; error = nil;
+    CHECK(![cloud downloadItems:files timeout:1 error:&error] && [error.localizedDescription containsString:@"asynchronous download failure"],
+        "asynchronous transfer failure aborts preflight");
+    cloud = [DownloadCloud new]; cloud.expectedRequests = files.count; cloud.stalled = YES; error = nil;
+    CHECK(![cloud downloadItems:files timeout:0 error:&error] && [error.localizedDescription containsString:@"timed out"],
+        "stalled download terminates without allowing backup or restore");
+}
 int main(void) {
     @autoreleasepool {
         NSFileManager *fm = NSFileManager.defaultManager;
         NSURL *root = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString] isDirectory:YES];
         NSURL *cloud = child(root, @"cloud"), *a = child(root, @"device-a"), *b = child(root, @"device-b");
         for (NSURL *u in @[cloud, a, b]) CHECK([fm createDirectoryAtURL:u withIntermediateDirectories:YES attributes:nil error:NULL], "create fixture");
+        testDownloads(root);
         put(a, @"progress", @"initial");
         NSError *registrationError;
         DMCloudSaveStore *unregistered = [[DMCloudSaveStore alloc] initWithFolder:cloud local:a title:@"save"];

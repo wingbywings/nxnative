@@ -16,6 +16,7 @@
 #include <os/proc.h>
 #endif
 #include "dm.h"
+#include "memstat.h"
 
 void svc_guest_range(uint8_t **base, size_t *size);
 enum { C_GUEST, C_CODE, C_MALLOC, C_GPU, C_STACK, C_FILE, C_OTHER, NC };
@@ -55,7 +56,7 @@ static void dump_regions(const char *path) {
 }
 
 static void sample(FILE *f, double t, id<MTLDevice> dev) {
-    task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    task_vm_info_data_t vi = {0}; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
     uint64_t fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS ? vi.phys_footprint : 0;
     uint64_t avail = 0;
 #if TARGET_OS_IPHONE
@@ -84,33 +85,27 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
             vi.internal >> 20, vi.compressed >> 20, (vi.ledger_tag_graphics_footprint + vi.ledger_tag_graphics_footprint_compressed) >> 20,
             (long long)(vi.limit_bytes_remaining >> 20));
     for (int c = 0; c < NC; c++) fprintf(f, "\t%llu/%llu/%llu", virt[c] >> 20, res[c] >> 20, bill[c] >> 20);
-    fprintf(f, "\t%llu\t%lld\n", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
+    fprintf(f, "\t%llu\t%lld\t%lld\n", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20,
+            (long long)(vi.ledger_phys_footprint_peak >> 20));
     fflush(f);
 }
 
 static void *memstat_thread(void *p) {
     FILE *f = fopen((const char *)p, "w");
-    if (!f) { LOG("memstat: cannot open %s", (const char *)p); return NULL; }
+    if (!f) { LOG("[RED] memstat: cannot open %s: %s", (const char *)p, strerror(errno)); free(p); return NULL; }
+    LOG("memstat: writing %s (one sample per second)", (const char *)p);
     fprintf(f, "# unit MiB; kernel accounting internal / compressed / graphics ledger / headroom to the limit; class columns = virtual/resident/charged (deduplicated per object); charged total = Σ private charged; unattributed = phys_footprint − charged total\nseconds\tphys_footprint\tavailable\tmetal_alloc\tinternal\tcompressed\tgraphics\theadroom");
     for (int c = 0; c < NC; c++) fprintf(f, "\t%s", k_cls[c]);
-    fprintf(f, "\tcharged total\tunattributed\n");
+    fprintf(f, "\tcharged total\tunattributed\tfootprint_peak\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();   // The same device object as the graphics backend (the system default device singleton)
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;
     char dp[1100]; snprintf(dp, sizeof dp, "%s.regions", (const char *)p);
+    free(p);
     for (int sec = 0;; sec++) { sample(f, (now_ns() - t0) / 1e9, dev); if (sec == dump_at) dump_regions(dp); sleep(1); }
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
-    const char *p = getenv("DM_MEMSTAT");
-    if (!p || !*p) return;
-    char *path = strdup(p);
-#if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
-#endif
-    pthread_t th; pthread_create(&th, NULL, memstat_thread, path); pthread_detach(th);
-}
 
 // ---------- Per-thread CPU: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS a relative name → the container's Documents) ----------
 // Every interval, walk all threads of this process (task_threads), take the thread name and user + system CPU time (ns) from THREAD_EXTENDED_INFO, and difference them by thread id:
@@ -119,7 +114,10 @@ __attribute__((constructor)) static void memstat_start(void) {
 #define THR_MAX 512
 static void *thrcpu_thread(void *p) {
     char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
-    FILE *f = fopen(path, "w"); if (!f) return NULL;
+    free(p);
+    FILE *f = fopen(path, "w");
+    if (!f) { LOG("[RED] thrcpu: cannot open %s: %s", path, strerror(errno)); return NULL; }
+    LOG("thrcpu: writing %s (sample interval %d seconds)", path, iv);
     fprintf(f, "seconds\tthread ID\tthread name\tCPU%%\n"); fflush(f);
     static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
     for (;;) {
@@ -144,12 +142,32 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
-    const char *p = getenv("DM_THRCPU");
+static void sampler_start(const char *env, dispatch_once_t *once, void *(*worker)(void *)) {
+    const char *p = getenv(env);
     if (!p || !*p) return;
-    char *spec = strdup(p);
+    dispatch_once(once, ^{
+        char *spec = NULL;
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
+        // iOS calls this after its env files and log are ready, never from a constructor.
+        if (*p != '/') {
+            const char *home = getenv("HOME");
+            if (!home) { LOG("[RED] %s: HOME is unavailable", env); return; }
+            if (asprintf(&spec, "%s/Documents/%s", home, p) < 0) spec = NULL;
+        } else
 #endif
-    pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+        spec = strdup(p);
+        if (!spec) { LOG("[RED] %s: cannot allocate output path", env); return; }
+        pthread_t th; int err = pthread_create(&th, NULL, worker, spec);
+        if (err) { LOG("[RED] %s: cannot start sampler: %s", env, strerror(err)); free(spec); return; }
+        pthread_detach(th);
+    });
 }
+void dm_diagnostics_start(void) {
+    static dispatch_once_t memory_once, cpu_once;
+    sampler_start("DM_MEMSTAT", &memory_once, memstat_thread);
+    sampler_start("DM_THRCPU", &cpu_once, thrcpu_thread);
+}
+#if !TARGET_OS_IPHONE
+// Mac launchers set the environment before exec; keep sampling from process startup.
+__attribute__((constructor)) static void diagnostics_constructor(void) { dm_diagnostics_start(); }
+#endif

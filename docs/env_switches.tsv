@@ -1,5 +1,6 @@
 name	class	meaning
 DM_AB	diagnostic	`=<frames>` splits the run into phases of that many frames and alternates every switch set to `ab` (on in the odd phases); logs an `[ab]` line per phase with GPU and frame time and attachment traffic
+DM_ADHOC_SIGN	switch	`0` skips executable ad-hoc signing in build_ipa.sh while retaining generated entitlement requirements; default signs the executable so sideloaders can read the requested grants
 DM_ALIAS_SIZE	diagnostic	`=<bytes>` gives the guest an alias region of that size instead of the profile's (at least 256 MB, whole host pages; the heap and stacks stay as they are): `0x1000000000`, the Switch's 64 GB, holds what a game reserves unchanged; the NSP script's address region check sets it (Mac only: an iPhone has no room)
 DM_ALIAS_WINDOWS	diagnostic	`=<MB>` logs every 30 s how much of each window of that size in the alias region is mapped (windows aligned to their size in absolute addresses)
 DM_ALLOW_OTHER_METAL	switch	`1` lets `own_compilers.py` build the shader libraries with a Metal compiler other than the one in `dmsh_chain.lock` (it stops otherwise, GitHub issue #242); the NSP script sets it for `--allow-other-metal`
@@ -88,11 +89,13 @@ DM_MOTION_AXES	switch	`=<map>` such as `x,-z,y`: maps Apple's controller axes to
 DM_MOTION_GAIN	switch	`=<gain>`: how fast the orientation is pulled toward the measured gravity, in rad/s per unit error (default 0.5; `0` integrates the gyro alone)
 DM_MOTION_HID	switch	On the Mac, `0` disables the passive Switch Pro Controller HID motion fallback (`motion_pro_mac.h`); enabled by default when exactly one physical Pro and one GameController Pro can use the same player slot; usable GameController motion takes priority
 DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second per source (phone / GameController / controller HID; acceleration in G, gyro in revolutions/s), for checking the axes: flat and still reads acc 0 0 -1
+DM_MOTION_ZERO	diagnostic	`0` keeps the raw gyroscope bias for comparison; default enables the stationary gyro zero-point correction
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NICK	switch	The account nickname the game sees (default `Player`)
 DM_NRO	switch	`0` turns off loading of the NRO modules the game's NRR files register (on by default): every `nn::ro::LoadModule` then fails
 DM_NVN_ALLOCPROF	diagnostic	`=1` charges Metal allocation growth to each replayed op type and function, and logs command allocator sizes and each new texture (serial, size, format, storage)
+DM_NVN_ALLOC_TRIM	diagnostic	Unset samples completed command allocator capacity and replaces allocators over 64 MiB when iOS headroom is below 1536 MiB; `0` disables replacement, `1` forces the pressure condition for comparison (also on Mac); attempts are at least ten seconds apart per slot
 DM_NVN_API	switch	`=<major>.<minor>` overrides the NVN API version `nvnDeviceGetInteger` reports (by default decided by the SDK version or the profile's `device_api`: 55.15 for SDK 11 and later, 53.313 before)
 DM_NVN_BARRIER	switch	How draw passes are ordered: `full` (default) waits for all earlier GPU work, `game` only for the previous pass's fragment stage unless the game set a barrier, `ab` alternates with the `DM_AB` phases
 DM_NVN_BF_WANT	path	`=<file>`: appends the key of each fragment shader whose passes could not be merged for lack of a readable-tile version to that file, once per key
@@ -285,7 +288,10 @@ DM_SYMCHECK	diagnostic	`=1` checks every hashed module symbol lookup against a l
 DM_TBUF_ALIGN	diagnostic	`=<bytes>` uses that value as the linear-texture alignment for buffer textures when it is larger than the device's `minimumLinearTextureAlignmentForPixelFormat`: a Mac can then reproduce a phone's larger alignment (a 64-byte one fails the buffers a device with 64 bytes cannot view), to check `tbuf_as_2d`'s aligned-row copy
 DM_TEAM_ID	switch	Apple team ID for the per-game Xcode project, used when `--team-id` / `TEAM_ID` is not given; `build_ipa.sh` uses the placeholder `0000000000` (unsigned) when unset
 DM_TEMP	path	Temporary storage folder (default `$DM_ROOT/run/platform/temp`); stand-in system data goes in `<DM_TEMP>_sysdata`; the Mac launcher, the iOS app and the NSP script set it
+DM_TEST_ARCHIVE_BATCH	test	Use three-capture batches and inject a serializer failure during the synthetic archive replay; tests bounded writes and map-limit splitting
 DM_TEST_ARCHIVE_CONSTANTS	test	Use optional function constants in the synthetic pipeline archive restart fixture
+DM_TEST_ARCHIVE_FAIL	test	With DM_TEST_ARCHIVE_BATCH, inject a hard archive-write failure instead of a splittable database-map-limit failure
+DM_TEST_ARCHIVE_LEGACY	test	Expect preserved legacy files in the archive restart fixture after the Python test removes capture-count sidecars
 DM_TEST_ARCHIVE_MIXED	test	Mix a newly compiled shader function with compacted bases in the archive restart fixture
 DM_TEST_BORDER	test	Path to the native t_border executable that test_dmsh_border.py runs a rewritten shader through on the GPU (`make check_t_border` sets it)
 DM_TEST_BUILD	test	Build folder of `dm/host/tests` whose `t_svc_memory` `test_memory_profile.py` runs (default `build`; `make asan` sets `build/asan`)

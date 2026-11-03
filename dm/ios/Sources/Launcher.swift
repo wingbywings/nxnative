@@ -132,7 +132,7 @@ private struct LauncherView: View {
                     Section {
                         Button("Back up to iCloud") { restoreCloud = false; confirmCloud = true }
                         Button("Restore from iCloud") { restoreCloud = true; confirmCloud = true }
-                        if cloudBusy { ProgressView("Working…") }
+                        if cloudBusy { ProgressView(restoreCloud ? "Downloading and restoring…" : "Downloading and backing up…") }
                     } header: {
                         Text("iCloud saves")
                     } footer: {
@@ -179,7 +179,7 @@ private struct LauncherView: View {
     private func transferCloud() {
         guard !cloudBusy else { return }
         cloudBusy = true
-        cloudMessage = restoreCloud ? "Downloading and restoring save and cheats…" : "Backing up save and cheats…"
+        cloudMessage = restoreCloud ? "Downloading the latest iCloud backup, then restoring save and cheats…" : "Downloading the latest iCloud contents, then backing up save and cheats…"
         cloudTransfer(restoreCloud ? 1 : 0) { message in
             cloudMessage = message as String
             cloudBusy = false
