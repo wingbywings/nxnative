@@ -56,7 +56,27 @@ static size_t tex_size(int fmt, int w, int h, int flags, size_t *align) {
     return P(nvnTextureBuilderGetStorageSize)(&tb);
 }
 
-int main(void) {
+// Exercise the real generated assembly without creating a Metal device. The
+// uncounted path must preserve arguments/results and still reach the right slot.
+static int thunk_counts(int counted) {
+    gpa = (PFNNVNDEVICEGETPROCADDRESSPROC)h_nvnBootstrapLoader("nvnDeviceGetProcAddress");
+    const char *name = "nvnDeviceGetTimestampInNanoseconds";
+    NVNT_nvnDeviceGetTimestampInNanoseconds fn = (NVNT_nvnDeviceGetTimestampInNanoseconds)proc(name);
+    unsigned slot = 0;
+    while (slot < NVN_NFUNC && strcmp(nvn_names[slot], name)) slot++;
+    if (slot == NVN_NFUNC) return 1;
+    uint64_t before = atomic_load(&nvn_slot[slot].cnt);
+    for (unsigned i = 1; i <= 16; i++) {
+        NVNcounterData counter = {0, 614400 * i};
+        EXPECT("thunk preserves arguments and result", 1000000 * i, fn(&dev, &counter));
+    }
+    EXPECT("only requested counts change", counted ? 16 : 0, atomic_load(&nvn_slot[slot].cnt) - before);
+    return g_fail != 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--thunks")) return thunk_counts(atoi(argv[2]));
+    setenv("DM_NVN_COUNT", "1", 1);   // the call-count checks below need the counting trampolines (off by default)
     // Engine-native limiters have no FPS state page. Their launcher cap must
     // still pace presents and select the display-link rate in display mode.
     { win_t w={.interval=1};nvn_present_config(60,1);dm_fps_state=NULL;
